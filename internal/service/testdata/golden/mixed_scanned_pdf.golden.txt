@@ -1,0 +1,10 @@
+unit="hal." total_pages=4 empty_pages=[2] truncated=false
+--- 1 ---
+BERITA ACARA SERAH TERIMA
+Aplikasi CorePay versi 1.1 telah diuji dan dinyatakan lulus.
+--- 2 ---
+
+--- 3 ---
+Lampiran: daftar modul yang diserahterimakan.
+--- 4 ---
+

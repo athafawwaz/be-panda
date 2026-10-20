@@ -1,0 +1,9 @@
+unit="" total_pages=0 empty_pages=[] truncated=false
+--- 1 ---
+BERITA ACARA SERAH TERIMA
+Aplikasi CorePay versi 1.1 diserahterimakan pada 12 Oktober 2026.
+Modul
+| Status
+| Pembayaran
+| Lulus UAT
+|

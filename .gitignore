@@ -1,0 +1,20 @@
+# env: semua diabaikan kecuali template .env.example
+.env
+.env.*
+!.env.example
+
+# hasil build
+*.exe
+/bin/
+
+# dokumen yang diunggah user (jangan pernah di-commit)
+/uploads/
+
+# hasil evaluasi rag-eval (bisa memuat judul dokumen internal)
+/eval/*.json
+!/eval/rag_eval.example.json
+
+# misc
+*.test
+*.out
+coverage*

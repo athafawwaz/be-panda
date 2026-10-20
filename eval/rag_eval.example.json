@@ -1,0 +1,30 @@
+[
+  {
+    "id": "q01",
+    "question": "Apa hasil UAT CorePay versi 1.1?",
+    "expect_docs": ["GANTI_DENGAN_STANDARDIZED_NAME_UAT_COREPAY_V1.1"],
+    "expect_phrases": ["lulus"]
+  },
+  {
+    "id": "q02",
+    "question": "Tolong jelaskan hasil pengujian aplikasi SAP modul keuangan tahun 2024 terkait UAT",
+    "expect_docs": ["GANTI_DENGAN_STANDARDIZED_NAME_UAT_SAP_KEUANGAN"]
+  },
+  {
+    "id": "q03",
+    "question": "Kapan serah terima aplikasi SIMSKBDN dilakukan?",
+    "expect_docs": ["GANTI_DENGAN_STANDARDIZED_NAME_BAST_SIMSKBDN"],
+    "expect_phrases": ["serah terima"]
+  },
+  {
+    "id": "q04",
+    "question": "bagaimana dengan versi sebelumnya?",
+    "history": ["Apa hasil UAT CorePay versi 1.1?"],
+    "expect_docs": ["GANTI_DENGAN_STANDARDIZED_NAME_UAT_COREPAY_V1.0"]
+  },
+  {
+    "id": "n01",
+    "question": "Bagaimana prosedur klaim asuransi kendaraan dinas?",
+    "negative": true
+  }
+]
