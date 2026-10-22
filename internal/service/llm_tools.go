@@ -10,6 +10,10 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/param"
 )
 
 // Dukungan tool calling OpenAI-compatible (/chat/completions dengan "tools"). Fungsi teks biasa di llm_client.go
@@ -117,32 +121,68 @@ func classifyToolsError(err error) error {
 	return err
 }
 
-func toolChatPayload(cfg LLMConfig, req toolChatRequest, stream bool) map[string]any {
+func toolChatPayload(cfg LLMConfig, req toolChatRequest, stream bool) openai.ChatCompletionNewParams {
 	temperature := 0.2
 	if req.Temperature != nil {
 		temperature = *req.Temperature
 	}
-	payload := map[string]any{
-		"model":       cfg.Model,
-		"messages":    req.Messages,
-		"temperature": temperature,
+	payload := openai.ChatCompletionNewParams{Model: cfg.Model, Temperature: openai.Float(temperature)}
+	for _, msg := range req.Messages {
+		// Preserve provider extensions (Gemini thought signatures) and null assistant content.
+		payload.Messages = append(payload.Messages, param.Override[openai.ChatCompletionMessageParamUnion](msg))
+	}
+	for _, tool := range req.Tools {
+		payload.Tools = append(payload.Tools, openai.ChatCompletionFunctionTool(openai.FunctionDefinitionParam{
+			Name: tool.Function.Name, Description: openai.String(tool.Function.Description),
+			Parameters: openai.FunctionParameters(tool.Function.Parameters),
+		}))
 	}
 	if req.MaxTokens > 0 {
-		payload["max_tokens"] = req.MaxTokens
+		payload.MaxTokens = openai.Int(int64(req.MaxTokens))
 	}
 	if len(req.Tools) > 0 {
-		payload["tools"] = req.Tools
 		choice := req.ToolChoice
 		if choice == "" {
 			choice = "auto"
 		}
-		payload["tool_choice"] = choice
+		payload.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{OfAuto: openai.String(choice)}
 	}
 	if stream {
-		payload["stream"] = true
-		payload["stream_options"] = map[string]bool{"include_usage": true}
+		payload.SetExtraFields(map[string]any{"stream": true, "stream_options": map[string]bool{"include_usage": true}})
 	}
 	return payload
+}
+
+func postToolChat(ctx context.Context, cfg LLMConfig, payload openai.ChatCompletionNewParams, timeout time.Duration) (*http.Response, error) {
+	client := openai.NewChatCompletionService(
+		option.WithBaseURL(cfg.BaseURL), option.WithAPIKey(cfg.APIKey),
+		option.WithMaxRetries(0), option.WithHTTPClient(&http.Client{Timeout: timeout}),
+	)
+	var raw *http.Response
+	// ponytail: retain strict raw decoding for compatible gateways; use SDK streaming when it guarantees terminal completion and extension round-trips.
+	_, err := client.New(ctx, payload, option.WithResponseBodyInto(&raw))
+	if err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) || ctx.Err() != nil {
+			return nil, err
+		}
+		if raw != nil && raw.StatusCode >= 300 && raw.Body != nil {
+			body, readErr := io.ReadAll(raw.Body)
+			raw.Body.Close()
+			if readErr != nil {
+				return nil, fmt.Errorf("read LLM response: %w", readErr)
+			}
+			return nil, &LLMError{Status: raw.StatusCode, Body: string(body)}
+		}
+		var apiErr *openai.Error
+		if errors.As(err, &apiErr) {
+			if raw != nil && raw.Body != nil {
+				raw.Body.Close()
+			}
+			return nil, &LLMError{Status: apiErr.StatusCode, Body: apiErr.RawJSON()}
+		}
+		return nil, err
+	}
+	return raw, nil
 }
 
 // rawToolCall menampung tool call dari respons (lengkap) atau potongan stream (delta).
@@ -265,21 +305,21 @@ func toolUsage(body *toolResponseBody, msgs []chatMessage, content string, calls
 
 // chatCompletionTools memanggil model dengan tools tanpa streaming.
 func chatCompletionTools(ctx context.Context, cfg LLMConfig, req toolChatRequest) (toolChatResult, error) {
-	resp, err := postChat(ctx, cfg, toolChatPayload(cfg, req, false), req.Timeout)
+	resp, err := postToolChat(ctx, cfg, toolChatPayload(cfg, req, false), req.Timeout)
 	if err != nil {
-		recordLLMUsage(cfg, 0, 0, 0, err)
-		return toolChatResult{Usage: LLMUsage{Calls: 1}}, err
+		status := 0
+		var llmErr *LLMError
+		if errors.As(err, &llmErr) {
+			status = llmErr.Status
+		}
+		recordLLMUsage(cfg, status, 0, 0, err)
+		return toolChatResult{Usage: LLMUsage{Calls: 1}}, classifyToolsError(err)
 	}
 	defer resp.Body.Close()
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		recordLLMUsage(cfg, resp.StatusCode, 0, 0, err)
 		return toolChatResult{Usage: LLMUsage{Calls: 1}}, fmt.Errorf("read LLM response: %w", err)
-	}
-	if resp.StatusCode >= 300 {
-		llmErr := &LLMError{Status: resp.StatusCode, Body: string(respBytes)}
-		recordLLMUsage(cfg, resp.StatusCode, 0, 0, llmErr)
-		return toolChatResult{Usage: LLMUsage{Calls: 1}}, classifyToolsError(llmErr)
 	}
 	return parseToolResponse(cfg, resp.StatusCode, respBytes, req.Messages, nil)
 }
@@ -327,38 +367,23 @@ func parseToolResponse(cfg LLMConfig, status int, respBytes []byte, msgs []chatM
 // (membalas JSON biasa) tetap dilayani.
 func chatCompletionStreamTools(ctx context.Context, cfg LLMConfig, req toolChatRequest, onDelta func(string), onToolStart func(name string)) (toolChatResult, error) {
 	payload := toolChatPayload(cfg, req, true)
-	resp, err := postChat(ctx, cfg, payload, req.Timeout)
-	if err == nil && resp.StatusCode == http.StatusBadRequest {
-		body, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			recordLLMUsage(cfg, resp.StatusCode, 0, 0, readErr)
-			return toolChatResult{Usage: LLMUsage{Calls: 1}}, fmt.Errorf("read LLM response: %w", readErr)
-		}
-		if !strings.Contains(strings.ToLower(string(body)), "stream_options") {
-			llmErr := &LLMError{Status: resp.StatusCode, Body: string(body)}
-			recordLLMUsage(cfg, resp.StatusCode, 0, 0, llmErr)
-			return toolChatResult{Usage: LLMUsage{Calls: 1}}, classifyToolsError(llmErr)
-		}
-		delete(payload, "stream_options")
-		resp, err = postChat(ctx, cfg, payload, req.Timeout)
+	resp, err := postToolChat(ctx, cfg, payload, req.Timeout)
+	var rejected *LLMError
+	if errors.As(err, &rejected) && rejected.Status == http.StatusBadRequest && strings.Contains(strings.ToLower(rejected.Body), "stream_options") {
+		payload.SetExtraFields(map[string]any{"stream": true})
+		resp, err = postToolChat(ctx, cfg, payload, req.Timeout)
 	}
 	if err != nil {
-		recordLLMUsage(cfg, 0, 0, 0, err)
-		return toolChatResult{Usage: LLMUsage{Calls: 1}}, err
+		status := 0
+		var llmErr *LLMError
+		if errors.As(err, &llmErr) {
+			status = llmErr.Status
+		}
+		recordLLMUsage(cfg, status, 0, 0, err)
+		return toolChatResult{Usage: LLMUsage{Calls: 1}}, classifyToolsError(err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 300 {
-		respBytes, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			recordLLMUsage(cfg, resp.StatusCode, 0, 0, readErr)
-			return toolChatResult{Usage: LLMUsage{Calls: 1}}, fmt.Errorf("read LLM response: %w", readErr)
-		}
-		llmErr := &LLMError{Status: resp.StatusCode, Body: string(respBytes)}
-		recordLLMUsage(cfg, resp.StatusCode, 0, 0, llmErr)
-		return toolChatResult{Usage: LLMUsage{Calls: 1}}, classifyToolsError(llmErr)
-	}
 	if !strings.Contains(resp.Header.Get("Content-Type"), "event-stream") {
 		respBytes, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {

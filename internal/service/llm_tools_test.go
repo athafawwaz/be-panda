@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -395,5 +397,78 @@ func TestChatCompletionStreamToolsAcceptsAzureFilterMetadata(t *testing.T) {
 	res, err := chatCompletionStreamTools(context.Background(), cfg, toolReq(textMessage("user", "x")), nil, nil)
 	if err != nil || res.Content != "ok" {
 		t.Fatalf("valid filter metadata rejected: %+v %v", res, err)
+	}
+}
+
+func TestOpenAISDKDoesNotRetryRateLimits(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		calls := 0
+		cfg := testLLMServer(t, func(w http.ResponseWriter, body map[string]any) {
+			calls++
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
+		})
+		var err error
+		if stream {
+			_, err = chatCompletionStreamTools(context.Background(), cfg, toolReq(textMessage("user", "x")), nil, nil)
+		} else {
+			_, err = chatCompletionTools(context.Background(), cfg, toolReq(textMessage("user", "x")))
+		}
+		var llmErr *LLMError
+		if calls != 1 || !errors.As(err, &llmErr) || llmErr.Status != http.StatusTooManyRequests {
+			t.Fatalf("hidden SDK retry or lost status: calls=%d err=%v", calls, err)
+		}
+	}
+}
+
+func TestOpenAISDKUsesConfiguredEndpointAndCredentials(t *testing.T) {
+	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:1/wrong")
+	t.Setenv("OPENAI_API_KEY", "wrong-environment-key")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer configured-key" {
+			t.Errorf("SDK request used wrong path or credentials")
+		}
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	cfg := LLMConfig{Provider: "custom", BaseURL: srv.URL + "/v1", Model: "test-model", APIKey: "configured-key"}
+	res, err := chatCompletionTools(context.Background(), cfg, toolReq(textMessage("user", "x")))
+	if err != nil || res.Content != "ok" {
+		t.Fatalf("SDK ignored configured provider: %+v %v", res, err)
+	}
+}
+
+func TestOpenAISDKRoundTripsToolSchemasAndGeminiSignature(t *testing.T) {
+	msgs := []chatMessage{{Role: "assistant", ToolCalls: []toolCall{{
+		ID: "g1", Type: "function", Function: toolCallFunction{Name: "list_documents", Arguments: "{}"},
+		ExtraContent: json.RawMessage(`{"google":{"thought_signature":"SIG123"}}`),
+	}}}}
+	defs := toolDefinitions()
+	wantTools, err := json.Marshal(defs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want any
+	if err := json.Unmarshal(wantTools, &want); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testLLMServer(t, func(w http.ResponseWriter, body map[string]any) {
+		if !reflect.DeepEqual(body["tools"], want) {
+			t.Errorf("SDK changed tool schemas: %v", body["tools"])
+		}
+		messages, err := json.Marshal(body["messages"])
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if !strings.Contains(string(messages), `"thought_signature":"SIG123"`) || !strings.Contains(string(messages), `"content":null`) {
+			t.Errorf("SDK dropped Gemini extension or null content: %s", messages)
+		}
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`)
+	})
+	req := toolReq(msgs...)
+	req.Tools = defs
+	if _, err := chatCompletionTools(context.Background(), cfg, req); err != nil {
+		t.Fatal(err)
 	}
 }
