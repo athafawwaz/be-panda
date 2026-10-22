@@ -2,6 +2,7 @@ package database
 
 import (
 	"embed"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -10,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/pressly/goose/v3"
-	"gorm.io/driver/sqlserver"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
@@ -20,37 +21,36 @@ import (
 //go:embed migrations/*.sql
 var embedMigrations embed.FS
 
-// Connect membuka koneksi SQL Server tanpa migrasi & seeding (dipakai juga oleh alat seperti cmd/rag-eval).
+// Connect membuka koneksi PostgreSQL tanpa migrasi & seeding (juga dipakai cmd/rag-eval).
 func Connect() (*gorm.DB, error) {
 	host := getEnv("DB_HOST", "localhost")
-	port := getEnv("DB_PORT", "1433")
+	port := getEnv("DB_PORT", "5432")
 	user := getEnv("DB_USER", "panda_user")
 	// Password tidak punya nilai default di kode (repo publik): wajib diisi lewat backend/.env
 	pass := getEnv("DB_PASSWORD", "")
 	if pass == "" {
 		return nil, fmt.Errorf("DB_PASSWORD belum diisi di backend/.env (salin dari backend/.env.example)")
 	}
-	dbName := getEnv("DB_NAME", "PandaDB")
-	encrypt := getEnv("DB_ENCRYPT", "disable")
+	dbName := getEnv("DB_NAME", "panda")
+	sslMode := getEnv("DB_SSLMODE", "disable")
 
 	query := url.Values{}
-	query.Add("database", dbName)
-	query.Add("encrypt", encrypt)
-	query.Add("TrustServerCertificate", "true")
+	query.Set("sslmode", sslMode)
 
 	u := &url.URL{
-		Scheme:   "sqlserver",
+		Scheme:   "postgres",
 		User:     url.UserPassword(user, pass),
 		Host:     fmt.Sprintf("%s:%s", host, port),
+		Path:     "/" + dbName,
 		RawQuery: query.Encode(),
 	}
 
 	dsn := u.String()
-	db, err := gorm.Open(sqlserver.Open(dsn), &gorm.Config{
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Warn),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to SQL Server: %w", err)
+		return nil, fmt.Errorf("failed to connect to PostgreSQL: %w", err)
 	}
 	return db, nil
 }
@@ -68,14 +68,15 @@ func ConnectAndMigrate() (*gorm.DB, error) {
 
 	// 1. Run Goose Migrations
 	goose.SetBaseFS(embedMigrations)
-	if err := goose.SetDialect("mssql"); err != nil {
-		log.Printf("[Goose] dialect warning: %v", err)
+	if err := goose.SetDialect("postgres"); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("migration dialect: %w", err)
 	}
 	if err := goose.Up(sqlDB, "migrations"); err != nil {
-		log.Printf("[Goose] migration status: %v", err)
-	} else {
-		log.Println("[Goose] SQL Server migrations applied successfully.")
+		sqlDB.Close()
+		return nil, fmt.Errorf("database migration failed: %w", err)
 	}
+	log.Println("[Goose] PostgreSQL migrations applied successfully.")
 
 	// 2. Run GORM AutoMigrate
 	err = db.AutoMigrate(
@@ -96,14 +97,16 @@ func ConnectAndMigrate() (*gorm.DB, error) {
 		&models.LLMUsageLog{},
 	)
 	if err != nil {
-		log.Printf("[AutoMigrate] notice: %v", err)
+		sqlDB.Close()
+		return nil, fmt.Errorf("schema synchronization failed: %w", err)
 	} else {
-		log.Println("[AutoMigrate] SQL Server schema synchronized.")
+		log.Println("[AutoMigrate] PostgreSQL schema synchronized.")
 	}
 
 	// 3. Seed Master Tim/Branch (database baru) & akun Super Admin awal
 	if err := SeedInitialData(db); err != nil {
-		log.Printf("[Seeder] warning: %v", err)
+		sqlDB.Close()
+		return nil, fmt.Errorf("database seeding failed: %w", err)
 	}
 
 	return db, nil
@@ -112,55 +115,68 @@ func ConnectAndMigrate() (*gorm.DB, error) {
 // SeedInitialData hanya menyiapkan master data organisasi (Tim & Branch) pada database baru
 // dan memastikan akun Super Admin awal tersedia. Tidak ada data contoh/dummy yang di-seed.
 func SeedInitialData(db *gorm.DB) error {
-	_ = os.MkdirAll(filepath.Join("uploads"), 0755)
-
-	// 1. Master Tim & Branch hanya pada database baru (tabel tim masih kosong),
-	// agar tim/branch yang sudah diubah atau dihapus Admin tidak muncul kembali saat restart.
-	var teamCount int64
-	db.Model(&models.MasterTeam{}).Count(&teamCount)
-	if teamCount == 0 {
-		teams := []models.MasterTeam{
-			{ID: "team-digitalisasi", TeamCode: "TIM_DIGITALISASI", TeamName: "Tim Digitalisasi", HasBranches: true},
-			{ID: "team-layanan", TeamCode: "TIM_LAYANAN_TI", TeamName: "Tim Layanan TI", HasBranches: false},
-			{ID: "team-infrastruktur", TeamCode: "TIM_INFRASTRUKTUR_TI", TeamName: "Tim Infrastruktur TI", HasBranches: false},
-			{ID: "team-tatakelola", TeamCode: "TIM_TATA_KELOLA_TI", TeamName: "Tim Tata Kelola TI", HasBranches: false},
-		}
-		for _, t := range teams {
-			db.Create(&t)
-		}
-
-		// Branch Tim Digitalisasi (Non Produksi, Produksi, Data)
-		branches := []models.MasterBranch{
-			{ID: "branch-dig-nonprod", TeamID: "team-digitalisasi", BranchCode: "NON_PRODUKSI", BranchName: "Non Produksi"},
-			{ID: "branch-dig-prod", TeamID: "team-digitalisasi", BranchCode: "PRODUKSI", BranchName: "Produksi"},
-			{ID: "branch-dig-data", TeamID: "team-digitalisasi", BranchCode: "DATA", BranchName: "Data"},
-		}
-		for _, b := range branches {
-			db.Create(&b)
-		}
+	if err := os.MkdirAll(filepath.Join("uploads"), 0755); err != nil {
+		return err
 	}
+	return db.Transaction(func(db *gorm.DB) error {
 
-	// 2. Akun Super Admin awal (Badge INITIAL_ADMIN_BADGE, default 2411249) selalu dipastikan ada
-	adminBadge := getEnv("INITIAL_ADMIN_BADGE", "2411249")
-	var existing models.User
-	if err := db.Where("badge_number = ?", adminBadge).First(&existing).Error; err != nil {
-		db.Create(&models.User{
-			ID:           "user-admin-" + adminBadge,
-			BadgeNumber:  adminBadge,
-			FullName:     "Atha Fawwaz (Super Admin PANDA)",
-			Email:        "atha.fawwaz@pusri.co.id",
-			PasswordHash: getEnv("BYPASS_PASSWORD", "Panda"),
-			Role:         models.RoleSuperAdmin,
-			IsActive:     true,
-		})
-	}
+		// 1. Master Tim & Branch hanya pada database baru (tabel tim masih kosong),
+		// agar tim/branch yang sudah diubah atau dihapus Admin tidak muncul kembali saat restart.
+		var teamCount int64
+		if err := db.Model(&models.MasterTeam{}).Count(&teamCount).Error; err != nil {
+			return err
+		}
+		if teamCount == 0 {
+			teams := []models.MasterTeam{
+				{ID: "team-digitalisasi", TeamCode: "TIM_DIGITALISASI", TeamName: "Tim Digitalisasi", HasBranches: true},
+				{ID: "team-layanan", TeamCode: "TIM_LAYANAN_TI", TeamName: "Tim Layanan TI", HasBranches: false},
+				{ID: "team-infrastruktur", TeamCode: "TIM_INFRASTRUKTUR_TI", TeamName: "Tim Infrastruktur TI", HasBranches: false},
+				{ID: "team-tatakelola", TeamCode: "TIM_TATA_KELOLA_TI", TeamName: "Tim Tata Kelola TI", HasBranches: false},
+			}
+			for _, t := range teams {
+				if err := db.Create(&t).Error; err != nil {
+					return err
+				}
+			}
 
-	// Badge awal selalu Super Admin (migrasi dari role ADMIN lama)
-	db.Model(&models.User{}).
-		Where("badge_number = ? AND role <> ?", adminBadge, models.RoleSuperAdmin).
-		Update("role", models.RoleSuperAdmin)
+			// Branch Tim Digitalisasi (Non Produksi, Produksi, Data)
+			branches := []models.MasterBranch{
+				{ID: "branch-dig-nonprod", TeamID: "team-digitalisasi", BranchCode: "NON_PRODUKSI", BranchName: "Non Produksi"},
+				{ID: "branch-dig-prod", TeamID: "team-digitalisasi", BranchCode: "PRODUKSI", BranchName: "Produksi"},
+				{ID: "branch-dig-data", TeamID: "team-digitalisasi", BranchCode: "DATA", BranchName: "Data"},
+			}
+			for _, b := range branches {
+				if err := db.Create(&b).Error; err != nil {
+					return err
+				}
+			}
+		}
 
-	return nil
+		// 2. Akun Super Admin awal (Badge INITIAL_ADMIN_BADGE, default 2411249) selalu dipastikan ada
+		adminBadge := getEnv("INITIAL_ADMIN_BADGE", "2411249")
+		var existing models.User
+		err := db.Where("badge_number = ?", adminBadge).First(&existing).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			if err := db.Create(&models.User{
+				ID:           "user-admin-" + adminBadge,
+				BadgeNumber:  adminBadge,
+				FullName:     "Atha Fawwaz (Super Admin PANDA)",
+				Email:        "atha.fawwaz@pusri.co.id",
+				PasswordHash: getEnv("BYPASS_PASSWORD", "Panda"),
+				Role:         models.RoleSuperAdmin,
+				IsActive:     true,
+			}).Error; err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+
+		// Badge awal selalu Super Admin (migrasi dari role ADMIN lama)
+		return db.Model(&models.User{}).
+			Where("badge_number = ? AND role <> ?", adminBadge, models.RoleSuperAdmin).
+			Update("role", models.RoleSuperAdmin).Error
+	})
 }
 
 // GenerateValidPDF creates a clean, standards-compliant 1-page PDF file so in-app PDF preview and download work out of the box.

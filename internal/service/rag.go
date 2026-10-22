@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -25,7 +26,7 @@ const (
 	maxChunkCandidates  = 1500 // batas baris chunk jalur LIKE lama (hanya selama re-index ke indeks kata)
 	chunksPerDocument   = 3    // jumlah potongan isi per dokumen yang dikirim ke LLM
 	leadingChunks       = 2    // dipakai bila dokumen cocok dari judul/ringkasan tapi tidak ada potongan isi yang cocok
-	termInsertBatch     = 500  // 500 baris x 4 kolom tetap di bawah batas 2100 parameter SQL Server
+	termInsertBatch     = 500  // 500 baris x 4 kolom tetap di bawah batas 65535 parameter PostgreSQL
 	exactMatchBonus     = 1.2  // pengali skor chunk yang memuat kata persis seperti ditulis user (meredam over-stemming)
 
 	// contentIndexVersion WAJIB dinaikkan setiap kali ekstraksi, normalisasi, chunking, tokenizer/stemming,
@@ -106,7 +107,7 @@ func IndexDocumentContent(db *gorm.DB, doc *models.Document, fileBytes []byte) C
 			return err
 		}
 		if len(chunkRows) > 0 {
-			// 100 baris x 6 kolom tetap di bawah batas 2100 parameter SQL Server
+			// 100 baris x 6 kolom tetap di bawah batas 65535 parameter PostgreSQL
 			if err := tx.CreateInBatches(chunkRows, 100).Error; err != nil {
 				return err
 			}
@@ -292,8 +293,9 @@ func termMatches(word, term string) bool {
 	return word == term || (len(term) >= 4 && strings.HasPrefix(word, term))
 }
 
+// escapeLike meloloskan metakarakter LIKE PostgreSQL (escape bawaan: backslash).
 func escapeLike(s string) string {
-	return strings.NewReplacer("[", "[[]", "%", "[%]", "_", "[_]").Replace(s)
+	return strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(s)
 }
 
 // textHasTerm: kata kunci muncul sebagai kata (bukan potongan kata) di dalam teks.
@@ -456,17 +458,17 @@ func rankChunks(stats []chunkTermStats, terms []searchTerm, totalChunks, avgLen 
 
 // retrieveChunksByLike adalah jalur pencarian lama (LIKE atas chunk_text) yang hanya dipakai selama dokumen dalam
 // cakupan masih diindeks ulang ke indeks kata. Kata dicocokkan dalam bentuk seperti ditulis user (tanpa stemming).
-func retrieveChunksByLike(db *gorm.DB, scopedIDs func() *gorm.DB, terms []searchTerm) (map[string][]chunkHit, map[string]map[string]bool) {
+func retrieveChunksByLike(db *gorm.DB, scopedIDs func() *gorm.DB, terms []searchTerm) (map[string][]chunkHit, map[string]map[string]bool, error) {
 	conds := make([]string, len(terms))
 	args := make([]interface{}, len(terms))
 	for i, t := range terms {
 		// Batas kata di sisi SQL agar kata pendek seperti "uat" tidak ikut menarik "buat"/"muat"
-		conds[i] = "(N' ' + chunk_text + N' ') LIKE ?"
-		pattern := "%[^a-z0-9]" + escapeLike(t.Display)
+		// ~* (regex, tanpa membedakan huruf besar) menggantikan LIKE + [^a-z0-9] ala SQL Server;
+		// ILIKE saja tidak cukup karena PostgreSQL tidak mendukung kelas karakter di LIKE.
+		conds[i] = "(' ' || chunk_text || ' ') ~* ?"
+		pattern := "[^a-z0-9]" + regexp.QuoteMeta(t.Display)
 		if len(t.Display) < 4 {
-			pattern += "[^a-z0-9]%"
-		} else {
-			pattern += "%"
+			pattern += "[^a-z0-9]"
 		}
 		args[i] = pattern
 	}

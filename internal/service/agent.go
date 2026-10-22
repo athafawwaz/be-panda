@@ -351,7 +351,7 @@ func (a *agentRun) filteredScope(f docFilter) func() *gorm.DB {
 		}
 		if f.AppCode != "" {
 			q = q.Where("application_id IN (?)", a.db.Model(&models.Application{}).Select("id").
-				Where("app_code = ? OR app_name LIKE ?", f.AppCode, "%"+escapeLike(f.AppCode)+"%"))
+				Where("LOWER(app_code) = LOWER(?) OR app_name ILIKE ?", f.AppCode, "%"+escapeLike(f.AppCode)+"%"))
 		}
 		return q.Select("id")
 	}

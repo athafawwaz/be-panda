@@ -75,7 +75,7 @@ func (h *Handler) AuthMiddleware() gin.HandlerFunc {
 
 		badge, _ := claims["badge_number"].(string)
 		var user models.User
-		if err := h.DB.Preload("Team").Preload("Branch").Where("badge_number = ? AND is_active = 1", badge).First(&user).Error; err != nil {
+		if err := h.DB.Preload("Team").Preload("Branch").Where("badge_number = ? AND is_active = ?", badge, true).First(&user).Error; err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Pengguna tidak ditemukan atau tidak aktif"})
 			c.Abort()
 			return
@@ -323,7 +323,7 @@ func (h *Handler) GetDashboardSummary(c *gin.Context) {
 	}
 
 	var totalUsers int64
-	h.DB.Model(&models.User{}).Where("is_active = 1").Count(&totalUsers)
+	h.DB.Model(&models.User{}).Where("is_active = ?", true).Count(&totalUsers)
 
 	c.JSON(http.StatusOK, gin.H{
 		"summary": gin.H{

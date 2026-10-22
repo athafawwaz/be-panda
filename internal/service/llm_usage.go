@@ -214,8 +214,8 @@ func GetLLMQuotaStatus(db *gorm.DB, cfg LLMConfig, withHistory bool) LLMQuotaSta
 	}
 
 	var agg struct{ Success, Failed, Tokens int }
-	scope().Select("COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS success, " +
-		"COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS failed, " +
+	scope().Select("COALESCE(SUM(CASE WHEN success THEN 1 ELSE 0 END), 0) AS success, "+
+		"COALESCE(SUM(CASE WHEN success THEN 0 ELSE 1 END), 0) AS failed, "+
 		"COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens").
 		Where("created_at >= ?", windowStart).Scan(&agg)
 	st.UsedToday, st.FailedToday, st.TokensToday = agg.Success, agg.Failed, agg.Tokens
@@ -236,14 +236,14 @@ func GetLLMQuotaStatus(db *gorm.DB, cfg LLMConfig, withHistory bool) LLMQuotaSta
 	if scope().Where("status_code = ?", http.StatusTooManyRequests).Order("id DESC").Limit(1).Find(&last429).RowsAffected > 0 &&
 		last429.RetryUntil != nil && last429.RetryUntil.After(now) {
 		var successAfter int64
-		scope().Where("success = 1 AND id > ?", last429.ID).Count(&successAfter)
+		scope().Where("success AND id > ?", last429.ID).Count(&successAfter)
 		if successAfter == 0 {
 			st.ExhaustedUntil = last429.RetryUntil
 		}
 	}
 
 	var lastErr models.LLMUsageLog
-	if scope().Where("success = 0").Order("id DESC").Limit(1).Find(&lastErr).RowsAffected > 0 {
+	if scope().Where("NOT success").Order("id DESC").Limit(1).Find(&lastErr).RowsAffected > 0 {
 		at := lastErr.CreatedAt
 		st.LastError, st.LastErrorAt = lastErr.ErrorMessage, &at
 	}
@@ -285,12 +285,12 @@ func loadUsageHistory(scope func() *gorm.DB, windowStart time.Time) []LLMUsageDa
 		Day                     time.Time
 		Success, Failed, Tokens int
 	}
-	scope().Select("CAST(created_at AS DATE) AS day, " +
-		"SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success, " +
-		"SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed, " +
+	scope().Select("CAST(created_at AT TIME ZONE 'UTC' AS DATE) AS day, "+
+		"SUM(CASE WHEN success THEN 1 ELSE 0 END) AS success, "+
+		"SUM(CASE WHEN success THEN 0 ELSE 1 END) AS failed, "+
 		"COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens").
 		Where("created_at >= ?", from).
-		Group("CAST(created_at AS DATE)").
+		Group("CAST(created_at AT TIME ZONE 'UTC' AS DATE)").
 		Scan(&rows)
 
 	byDay := map[string]LLMUsageDay{}

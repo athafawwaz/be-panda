@@ -188,10 +188,10 @@ func (h *Handler) AnalyzeAIUpload(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Sesi upload gagal dibuat"})
 		return
 	}
-	// Kedaluwarsa ditulis & dibandingkan memakai jam SQL Server: driver membaca DATETIME2 sebagai UTC,
-	// sehingga perbandingan dengan time.Now() di Go bisa meleset sebesar selisih zona waktu.
+	// Kedaluwarsa ditulis & dibandingkan memakai jam database (PostgreSQL now()), bukan time.Now() di Go,
+	// sehingga semua instance backend memakai satu acuan waktu yang sama.
 	h.DB.Model(&models.UploadStaging{}).Where("id = ?", staging.ID).
-		Update("expires_at", gorm.Expr("DATEADD(second, ?, SYSDATETIME())", int(stagingTTL.Seconds())))
+		Update("expires_at", gorm.Expr("now() + make_interval(secs => ?)", stagingTTL.Seconds()))
 
 	var duplicate gin.H
 	if dup := service.FindDuplicateInScope(h.DB, user, file.SHA256); dup != nil {
@@ -288,7 +288,7 @@ func (h *Handler) ConfirmAIUpload(c *gin.Context) {
 		return
 	}
 	var alive int64
-	h.DB.Model(&models.UploadStaging{}).Where("id = ? AND expires_at > SYSDATETIME()", st.ID).Count(&alive)
+	h.DB.Model(&models.UploadStaging{}).Where("id = ? AND expires_at > now()", st.ID).Count(&alive)
 	if alive == 0 {
 		h.discardStaging(st)
 		c.JSON(http.StatusGone, gin.H{"error": "Sesi upload sudah kedaluwarsa, silakan lampirkan ulang file"})
