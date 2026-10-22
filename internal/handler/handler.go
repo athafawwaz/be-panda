@@ -434,8 +434,13 @@ func (h *Handler) CreateApplication(c *gin.Context) {
 
 	folderID := c.Param("id")
 	var folder models.AppFolder
-	if err := h.DB.Preload("AssignedTeam").Preload("AssignedBranch").First(&folder, "id = ?", folderID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Folder tidak ditemukan"})
+	if err := h.DB.WithContext(c.Request.Context()).First(&folder, "id = ?", folderID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Folder tidak ditemukan"})
+		} else {
+			log.Printf("[Application] gagal memuat folder: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membaca folder"})
+		}
 		return
 	}
 
@@ -470,11 +475,6 @@ func (h *Handler) CreateApplication(c *gin.Context) {
 		CreatedByName:  user.FullName,
 	}
 
-	if err := h.DB.Create(&app).Error; err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Kode Aplikasi sudah digunakan atau gagal disimpan"})
-		return
-	}
-
 	initTitle := strings.TrimSpace(req.InitialTitle)
 	if initTitle == "" {
 		initTitle = "Pembuatan Awal Aplikasi (Initial Release)"
@@ -493,9 +493,8 @@ func (h *Handler) CreateApplication(c *gin.Context) {
 		CreatedByBadge:    user.BadgeNumber,
 		CreatedByName:     user.FullName,
 	}
-	h.DB.Create(&initSection)
 
-	h.DB.Create(&models.UploadAuditLog{
+	audit := models.UploadAuditLog{
 		BadgeNumber:        user.BadgeNumber,
 		UserName:           user.FullName,
 		UserRole:           user.Role,
@@ -507,10 +506,19 @@ func (h *Handler) CreateApplication(c *gin.Context) {
 		SectionVersion:     initSection.VersionLabel,
 		DetailDescription:  fmt.Sprintf("Admin %s (%s) mendaftarkan aplikasi '%s' (%s) di dalam folder '%s'", user.FullName, user.BadgeNumber, app.AppName, app.AppCode, folder.FolderName),
 		ActionTimestamp:    time.Now(),
-	})
+	}
 
-	h.DB.Preload("Sections").Preload("Sections.Documents").First(&app, "id = ?", app.ID)
-	c.JSON(http.StatusCreated, gin.H{"application": app})
+	created, err := service.CreateApplication(c.Request.Context(), h.DB, app, initSection, audit)
+	if err != nil {
+		if errors.Is(err, service.ErrApplicationCodeUsed) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Kode Aplikasi sudah digunakan"})
+		} else {
+			log.Printf("[Application] gagal membuat aplikasi: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membuat aplikasi"})
+		}
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"application": created})
 }
 
 func (h *Handler) GetApplicationDetail(c *gin.Context) {
