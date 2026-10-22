@@ -354,15 +354,7 @@ func (h *Handler) GetAIChatShortcuts(c *gin.Context) {
 		Preload("OwnerTeam").
 		Preload("OwnerBranch")
 
-	if !user.IsAdmin() {
-		if user.TeamID != nil && user.BranchID != nil {
-			query = query.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ? AND (owner_branch_id IS NULL OR owner_branch_id = '' OR owner_branch_id = ?))", *user.TeamID, *user.BranchID)
-		} else if user.TeamID != nil {
-			query = query.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ?)", *user.TeamID)
-		} else {
-			query = query.Where("visibility_scope = 'ALL_TIM'")
-		}
-	}
+	query = service.ApplyDocumentScope(query, user)
 
 	var docs []models.Document
 	if err := query.Order("uploaded_at DESC").Limit(50).Find(&docs).Error; err != nil {
