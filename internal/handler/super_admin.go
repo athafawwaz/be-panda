@@ -54,8 +54,10 @@ func aiSettingsPayload(cfg service.LLMConfig) gin.H {
 		engine = "PANDA Agent · tool calling (" + cfg.Model + ")"
 		toolCalling = service.ProviderSupportsTools(cfg)
 		if !toolCalling {
-			engine = "PANDA Thinking · agen JSON (" + cfg.Model + ", provider tanpa tool calling)"
+			engine = "PANDA Agent · model tidak mendukung tool calling (" + cfg.Model + ")"
 		}
+	} else if cfg.Provider != service.ProviderBuiltin {
+		engine = "PANDA Agent · API key belum diisi"
 	}
 	return gin.H{
 		"provider":          cfg.Provider,
@@ -65,7 +67,7 @@ func aiSettingsPayload(cfg service.LLMConfig) gin.H {
 		"api_key_masked":    service.MaskSecret(cfg.APIKey),
 		"source":            cfg.Source,
 		"engine_mode":       engine,
-		"tool_calling":      toolCalling, // provider dipakai lewat agent loop tool calling (false = fallback agen JSON)
+		"tool_calling":      toolCalling, // false bila model menolak tool calling; tidak ada planner pengganti
 		"share_doc_content": cfg.ShareDocContent,
 		// Jumlah tanya-jawab terakhir yang dibaca AI saat menjawab (0 = tidak membaca percakapan sebelumnya)
 		"chat_history_turns":     cfg.ChatHistoryTurns,

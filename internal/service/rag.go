@@ -311,15 +311,17 @@ func textHasTerm(text, term string) bool {
 // retrieveRelevantChunks mencari potongan isi dokumen yang paling cocok dengan pertanyaan (skor BM25),
 // beserta kata kunci yang muncul di isi tiap dokumen. scopedIDs membangun subquery id dokumen
 // yang boleh diakses user sehingga isolasi tim tetap berlaku.
-func retrieveRelevantChunks(db *gorm.DB, scopedIDs func() *gorm.DB, terms []searchTerm) (map[string][]chunkHit, map[string]map[string]bool) {
+func retrieveRelevantChunks(db *gorm.DB, scopedIDs func() *gorm.DB, terms []searchTerm) (map[string][]chunkHit, map[string]map[string]bool, error) {
 	if len(terms) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	// Selama re-index ke versi terbaru berjalan, sebagian dokumen belum punya indeks kata:
 	// pakai jalur LIKE lama untuk semua dokumen agar hasil pencarian tidak bolong dan skornya sebanding.
 	var stale int64
-	db.Model(&models.Document{}).Where("id IN (?)", scopedIDs()).
-		Where("content_indexed_at IS NULL OR content_index_version < ?", contentIndexVersion).Count(&stale)
+	if err := db.Model(&models.Document{}).Where("id IN (?)", scopedIDs()).
+		Where("content_indexed_at IS NULL OR content_index_version < ?", contentIndexVersion).Count(&stale).Error; err != nil {
+		return nil, nil, fmt.Errorf("check content index version: %w", err)
+	}
 	if stale > 0 {
 		return retrieveChunksByLike(db, scopedIDs, terms)
 	}
@@ -344,7 +346,7 @@ type termRow struct {
 
 // retrieveChunksByIndex membaca indeks kata (document_chunk_terms): query memakai index (term, document_id),
 // sehingga df, jumlah chunk, dan panjang rata-rata dihitung tepat atas seluruh dokumen dalam cakupan user.
-func retrieveChunksByIndex(db *gorm.DB, scopedIDs func() *gorm.DB, terms []searchTerm) (map[string][]chunkHit, map[string]map[string]bool) {
+func retrieveChunksByIndex(db *gorm.DB, scopedIDs func() *gorm.DB, terms []searchTerm) (map[string][]chunkHit, map[string]map[string]bool, error) {
 	exact := make([]string, 0, len(terms))
 	for _, t := range terms {
 		exact = append(exact, t.Term)
@@ -366,11 +368,10 @@ func retrieveChunksByIndex(db *gorm.DB, scopedIDs func() *gorm.DB, terms []searc
 		Where("t.document_id IN (?)", scopedIDs()).
 		Where("("+strings.Join(conds, " OR ")+")", args...).
 		Scan(&rows).Error; err != nil {
-		log.Printf("[RAG] gagal mencari indeks kata: %v", err)
-		return nil, nil
+		return nil, nil, fmt.Errorf("retrieve content term index: %w", err)
 	}
 	if len(rows) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	byChunk := map[string]*chunkTermStats{}
@@ -390,16 +391,21 @@ func retrieveChunksByIndex(db *gorm.DB, scopedIDs func() *gorm.DB, terms []searc
 	}
 
 	var totalChunks int64
-	db.Model(&models.DocumentChunk{}).Where("document_id IN (?)", scopedIDs()).Count(&totalChunks)
+	if err := db.Model(&models.DocumentChunk{}).Where("document_id IN (?)", scopedIDs()).Count(&totalChunks).Error; err != nil {
+		return nil, nil, fmt.Errorf("count content chunks: %w", err)
+	}
 	var avgLen float64
-	db.Model(&models.DocumentChunk{}).Select("COALESCE(AVG(CAST(token_count AS FLOAT)), 0)").
-		Where("document_id IN (?)", scopedIDs()).Scan(&avgLen)
+	if err := db.Model(&models.DocumentChunk{}).Select("COALESCE(AVG(CAST(token_count AS FLOAT)), 0)").
+		Where("document_id IN (?)", scopedIDs()).Scan(&avgLen).Error; err != nil {
+		return nil, nil, fmt.Errorf("average content chunk length: %w", err)
+	}
 
 	flat := make([]chunkTermStats, len(stats))
 	for i, s := range stats {
 		flat[i] = *s
 	}
-	return rankChunks(flat, terms, float64(totalChunks), avgLen)
+	hits, docTerms := rankChunks(flat, terms, float64(totalChunks), avgLen)
+	return hits, docTerms, nil
 }
 
 // rankChunks menilai chunk dengan BM25 (k1 = 1,2; b = 0,75) dikali bobot kata kunci, lalu mengutamakan chunk yang
@@ -479,15 +485,16 @@ func retrieveChunksByLike(db *gorm.DB, scopedIDs func() *gorm.DB, terms []search
 		Where(strings.Join(conds, " OR "), args...).
 		Limit(maxChunkCandidates).
 		Find(&rows).Error; err != nil {
-		log.Printf("[RAG] gagal mencari isi dokumen: %v", err)
-		return nil, nil
+		return nil, nil, fmt.Errorf("retrieve content text: %w", err)
 	}
 	if len(rows) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	var totalChunks int64
-	db.Model(&models.DocumentChunk{}).Where("document_id IN (?)", scopedIDs()).Count(&totalChunks)
+	if err := db.Model(&models.DocumentChunk{}).Where("document_id IN (?)", scopedIDs()).Count(&totalChunks).Error; err != nil {
+		return nil, nil, fmt.Errorf("count content chunks: %w", err)
+	}
 
 	stats := make([]chunkTermStats, len(rows))
 	totalLen := 0
@@ -515,11 +522,11 @@ func retrieveChunksByLike(db *gorm.DB, scopedIDs func() *gorm.DB, terms []search
 		}
 		byDoc[id] = hits
 	}
-	return byDoc, docTerms
+	return byDoc, docTerms, nil
 }
 
 // loadChunkTexts mengisi teks & urutan chunk untuk hit yang belum punya teks (hasil indeks kata).
-func loadChunkTexts(db *gorm.DB, hitsByDoc map[string][]chunkHit) {
+func loadChunkTexts(db *gorm.DB, hitsByDoc map[string][]chunkHit) error {
 	var ids []string
 	for _, hits := range hitsByDoc {
 		for _, h := range hits {
@@ -529,10 +536,12 @@ func loadChunkTexts(db *gorm.DB, hitsByDoc map[string][]chunkHit) {
 		}
 	}
 	if len(ids) == 0 {
-		return
+		return nil
 	}
 	var rows []models.DocumentChunk
-	db.Select("id", "chunk_index", "chunk_text").Where("id IN ?", ids).Find(&rows)
+	if err := db.Select("id", "chunk_index", "chunk_text").Where("id IN ?", ids).Find(&rows).Error; err != nil {
+		return fmt.Errorf("load content chunk texts: %w", err)
+	}
 	byID := make(map[string]models.DocumentChunk, len(rows))
 	for _, r := range rows {
 		byID[r.ID] = r
@@ -546,6 +555,7 @@ func loadChunkTexts(db *gorm.DB, hitsByDoc map[string][]chunkHit) {
 		}
 		hitsByDoc[docID] = hits
 	}
+	return nil
 }
 
 // rerankExactMatches memberi bonus pada chunk yang memuat kata persis seperti ditulis user, sehingga kecocokan
@@ -570,21 +580,23 @@ func rerankExactMatches(hitsByDoc map[string][]chunkHit, terms []searchTerm) {
 
 // loadLeadingChunks mengambil potongan awal dokumen, dipakai sebagai konteks bila dokumen cocok
 // dari judul/ringkasan tetapi kata kuncinya tidak muncul di isi.
-func loadLeadingChunks(db *gorm.DB, docIDs []string) map[string][]chunkHit {
+func loadLeadingChunks(db *gorm.DB, docIDs []string) (map[string][]chunkHit, error) {
 	if len(docIDs) == 0 {
-		return nil
+		return nil, nil
 	}
 	var rows []models.DocumentChunk
-	db.Select("id", "document_id", "chunk_index", "chunk_text").
+	if err := db.Select("id", "document_id", "chunk_index", "chunk_text").
 		Where("document_id IN ? AND chunk_index < ?", docIDs, leadingChunks).
 		Order("document_id, chunk_index").
-		Find(&rows)
+		Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("load leading content chunks: %w", err)
+	}
 
 	out := map[string][]chunkHit{}
 	for _, r := range rows {
 		out[r.DocumentID] = append(out[r.DocumentID], chunkHit{ChunkID: r.ID, DocumentID: r.DocumentID, ChunkIndex: r.ChunkIndex, Text: r.ChunkText})
 	}
-	return out
+	return out, nil
 }
 
 // excerptKeys: kata yang dicari saat membuat cuplikan, bentuk tulisan user dulu lalu bentuk dasarnya.

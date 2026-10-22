@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -770,17 +771,32 @@ func (h *Handler) AgenticAIChat(c *gin.Context) {
 	// Riwayat percakapan dibaca dari sesi milik akun asli (pemilik riwayat chat); jumlahnya diatur di Docs → API Key
 	actor, impersonating := getRealUser(c)
 
-	resp, err := service.ProcessAgenticQuery(h.DB, user, req, actor.ID)
+	resp, err := service.AnswerAgenticQuery(c.Request.Context(), h.DB, user, req, actor.ID, nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memproses pencarian Agentic AI"})
+		log.Printf("[Agentic AI] gagal: %v", err)
+		var agentErr *service.AgentError
+		if errors.As(err, &agentErr) {
+			c.JSON(http.StatusBadGateway, gin.H{"error": agentErr.Message})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memproses pencarian Agentic AI"})
+		}
 		return
 	}
-	h.recordAgenticChat(user, actor, impersonating, req, resp)
+	if c.Request.Context().Err() != nil {
+		return
+	}
+	h.recordAgenticChat(c.Request.Context(), user, actor, impersonating, req, resp)
 	c.JSON(http.StatusOK, resp)
 }
 
 // recordAgenticChat mencatat pencarian Agentic AI di log audit dan menyimpannya ke riwayat chat milik user.
-func (h *Handler) recordAgenticChat(user, actor models.User, impersonating bool, req service.AIChatRequest, resp *service.AIChatResponse) {
+func (h *Handler) recordAgenticChat(ctx context.Context, user, actor models.User, impersonating bool, req service.AIChatRequest, resp *service.AIChatResponse) {
+	if ctx.Err() != nil {
+		return
+	}
+	scoped := *h
+	scoped.DB = h.DB.WithContext(ctx)
+	h = &scoped
 	// Saat impersonate, log dicatat atas identitas asli Super Admin agar tidak tercampur ke log segmen
 	mode := ""
 	if req.Thinking && resp.Trace != nil {
@@ -883,10 +899,18 @@ func (h *Handler) AgenticAIChatStream(c *gin.Context) {
 	if err != nil {
 		if ctx.Err() == nil {
 			log.Printf("[Agentic AI] stream gagal: %v", err)
-			emit("error", gin.H{"error": "Gagal memproses pencarian Agentic AI"})
+			message := "Gagal memproses pencarian Agentic AI"
+			var agentErr *service.AgentError
+			if errors.As(err, &agentErr) {
+				message = agentErr.Message
+			}
+			emit("error", gin.H{"error": message})
 		}
 		return
 	}
-	h.recordAgenticChat(user, actor, impersonating, req, resp)
+	if ctx.Err() != nil {
+		return
+	}
+	h.recordAgenticChat(ctx, user, actor, impersonating, req, resp)
 	emit("done", resp)
 }
