@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
@@ -125,29 +125,29 @@ func (h *Handler) discardStaging(st models.UploadStaging) {
 	h.DB.Delete(&st)
 }
 
-func (h *Handler) AnalyzeAIUpload(c *gin.Context) {
+func (h *Handler) AnalyzeAIUpload(c fiber.Ctx) error {
 	user := getCurrentUser(c)
 	if !analyzeLimiter.allow(user.ID) {
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Terlalu banyak analisis upload dalam 1 menit. Coba lagi sebentar."})
-		return
+		return c.Status(http.StatusTooManyRequests).JSON(fiber.Map{"error": "Terlalu banyak analisis upload dalam 1 menit. Coba lagi sebentar."})
+
 	}
 	if status, msg := parseUploadForm(c); status != 0 {
-		c.JSON(status, gin.H{"error": msg})
-		return
+		return c.Status(status).JSON(fiber.Map{"error": msg})
+
 	}
 	file, status, msg := readUploadedFile(c)
 	if status != 0 {
-		c.JSON(status, gin.H{"error": msg})
-		return
+		return c.Status(status).JSON(fiber.Map{"error": msg})
+
 	}
-	message := truncateUTF8(strings.TrimSpace(c.PostForm("message")), 1000)
+	message := truncateUTF8(strings.TrimSpace(c.FormValue("message")), 1000)
 
 	stagingID := uuid.NewString()
-	stagingPath, err := storage.Save(c.Request.Context(), stagingKeyPrefix+stagingID+file.Ext, file.Data)
+	stagingPath, err := storage.Save(c.Context(), stagingKeyPrefix+stagingID+file.Ext, file.Data)
 	if err != nil {
 		log.Printf("[AI Upload] gagal menulis staging (%s): %v", storage.Describe(), err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "File gagal disimpan sementara"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "File gagal disimpan sementara"})
+
 	}
 
 	text, extractErr := service.ExtractDocumentText(file.Data, file.Ext)
@@ -168,7 +168,7 @@ func (h *Handler) AnalyzeAIUpload(c *gin.Context) {
 	}
 
 	// Simpan saran AI untuk dicatat di log audit sebagai pembanding pilihan akhir user
-	suggestionJSON, _ := json.Marshal(gin.H{"destinations": sugg.Destinations, "categories": sugg.Categories, "engine": sugg.Engine})
+	suggestionJSON, _ := json.Marshal(fiber.Map{"destinations": sugg.Destinations, "categories": sugg.Categories, "engine": sugg.Engine})
 	staging := models.UploadStaging{
 		ID:             stagingID,
 		UserID:         user.ID,
@@ -185,17 +185,17 @@ func (h *Handler) AnalyzeAIUpload(c *gin.Context) {
 	if err := h.DB.Create(&staging).Error; err != nil {
 		_ = storage.Remove(context.Background(), stagingPath)
 		log.Printf("[AI Upload] gagal menyimpan sesi staging: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Sesi upload gagal dibuat"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Sesi upload gagal dibuat"})
+
 	}
 	// Kedaluwarsa ditulis & dibandingkan memakai jam database (PostgreSQL now()), bukan time.Now() di Go,
 	// sehingga semua instance backend memakai satu acuan waktu yang sama.
 	h.DB.Model(&models.UploadStaging{}).Where("id = ?", staging.ID).
 		Update("expires_at", gorm.Expr("now() + make_interval(secs => ?)", stagingTTL.Seconds()))
 
-	var duplicate gin.H
+	var duplicate fiber.Map
 	if dup := service.FindDuplicateInScope(h.DB, user, file.SHA256); dup != nil {
-		duplicate = gin.H{
+		duplicate = fiber.Map{
 			"id":                dup.ID,
 			"title":             dup.Title,
 			"standardized_name": dup.StandardizedName,
@@ -208,10 +208,10 @@ func (h *Handler) AnalyzeAIUpload(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusCreated, gin.H{
+	return c.Status(http.StatusCreated).JSON(fiber.Map{
 		"staging_id": staging.ID,
 		"expires_at": staging.ExpiresAt,
-		"file": gin.H{
+		"file": fiber.Map{
 			"name":       file.OriginalName,
 			"size_bytes": len(file.Data),
 			"extension":  file.Ext,
@@ -274,53 +274,53 @@ func aiChoiceNote(suggestionJSON, destKey, category string) string {
 		s.Engine, rank(s.Destinations, destKey), category, rank(s.Categories, category))
 }
 
-func (h *Handler) ConfirmAIUpload(c *gin.Context) {
+func (h *Handler) ConfirmAIUpload(c fiber.Ctx) error {
 	user := getCurrentUser(c)
 	var req confirmAIUploadRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tujuan dan kategori dokumen wajib dipilih"})
-		return
+	if err := c.Bind().JSON(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Tujuan dan kategori dokumen wajib dipilih"})
+
 	}
 
 	var st models.UploadStaging
 	if err := h.DB.First(&st, "id = ? AND user_id = ?", req.StagingID, user.ID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Sesi upload tidak ditemukan atau sudah dibatalkan"})
-		return
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Sesi upload tidak ditemukan atau sudah dibatalkan"})
+
 	}
 	var alive int64
 	h.DB.Model(&models.UploadStaging{}).Where("id = ? AND expires_at > now()", st.ID).Count(&alive)
 	if alive == 0 {
 		h.discardStaging(st)
-		c.JSON(http.StatusGone, gin.H{"error": "Sesi upload sudah kedaluwarsa, silakan lampirkan ulang file"})
-		return
+		return c.Status(http.StatusGone).JSON(fiber.Map{"error": "Sesi upload sudah kedaluwarsa, silakan lampirkan ulang file"})
+
 	}
 
 	target, ok := parseDestinationKey(req.DestinationKey)
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tujuan upload tidak valid"})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Tujuan upload tidak valid"})
+
 	}
 	target.VisibilityScope, target.TargetTeamID, target.TargetBranchID = req.VisibilityScope, req.TargetTeamID, req.TargetBranchID
 
 	// Hak akses divalidasi ulang dengan aturan yang sama seperti upload manual
 	resolved, status, msg := h.resolveUploadTarget(user, target)
 	if status != 0 {
-		c.JSON(status, gin.H{"error": msg})
-		return
+		return c.Status(status).JSON(fiber.Map{"error": msg})
+
 	}
 
-	data, err := storage.Read(c.Request.Context(), st.FilePath)
+	data, err := storage.Read(c.Context(), st.FilePath)
 	if err != nil {
 		log.Printf("[AI Upload] file staging %s tidak terbaca: %v", st.FilePath, err)
 		h.discardStaging(st)
-		c.JSON(http.StatusGone, gin.H{"error": "File sementara sudah tidak tersedia, silakan lampirkan ulang"})
-		return
+		return c.Status(http.StatusGone).JSON(fiber.Map{"error": "File sementara sudah tidak tersedia, silakan lampirkan ulang"})
+
 	}
 	sum := sha256.Sum256(data)
 	if hex.EncodeToString(sum[:]) != st.FileHashSHA256 {
 		h.discardStaging(st)
-		c.JSON(http.StatusConflict, gin.H{"error": "File sementara berubah sejak dianalisis, silakan lampirkan ulang"})
-		return
+		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": "File sementara berubah sejak dianalisis, silakan lampirkan ulang"})
+
 	}
 
 	meta := documentMeta{
@@ -336,20 +336,20 @@ func (h *Handler) ConfirmAIUpload(c *gin.Context) {
 		LogNote:       aiChoiceNote(st.SuggestionJSON, req.DestinationKey, strings.ToUpper(strings.TrimSpace(req.Category))),
 	}
 	if status, msg := normalizeDocumentMeta(&meta, resolved, user); status != 0 {
-		c.JSON(status, gin.H{"error": msg})
-		return
+		return c.Status(status).JSON(fiber.Map{"error": msg})
+
 	}
 
 	file := uploadedFile{Data: data, OriginalName: st.OriginalName, Ext: st.FileExtension, SHA256: st.FileHashSHA256}
 	doc, logEntry, contentIndex, err := h.persistDocument(user, resolved, meta, file)
 	if err != nil {
 		log.Printf("[AI Upload] %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan dokumen. Silakan coba lagi."})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menyimpan dokumen. Silakan coba lagi."})
+
 	}
 	h.discardStaging(st)
 
-	c.JSON(http.StatusCreated, gin.H{
+	return c.Status(http.StatusCreated).JSON(fiber.Map{
 		"document":      doc,
 		"log":           logEntry,
 		"content_index": contentIndex,
@@ -357,13 +357,13 @@ func (h *Handler) ConfirmAIUpload(c *gin.Context) {
 	})
 }
 
-func (h *Handler) CancelAIUpload(c *gin.Context) {
+func (h *Handler) CancelAIUpload(c fiber.Ctx) error {
 	user := getCurrentUser(c)
 	var st models.UploadStaging
-	if err := h.DB.First(&st, "id = ? AND user_id = ?", c.Param("id"), user.ID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Sesi upload tidak ditemukan"})
-		return
+	if err := h.DB.First(&st, "id = ? AND user_id = ?", c.Params("id"), user.ID).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Sesi upload tidak ditemukan"})
+
 	}
 	h.discardStaging(st)
-	c.JSON(http.StatusOK, gin.H{"message": "Upload dibatalkan, file sementara dihapus"})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"message": "Upload dibatalkan, file sementara dihapus"})
 }

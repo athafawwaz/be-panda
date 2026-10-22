@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v3"
 	"gorm.io/gorm"
 
 	"panda-backend/internal/models"
@@ -19,17 +19,17 @@ import (
 const chatSessionListLimit = 100
 
 // GetChatSessions menampilkan daftar percakapan Agentic AI milik user yang login, terbaru di atas.
-func (h *Handler) GetChatSessions(c *gin.Context) {
+func (h *Handler) GetChatSessions(c fiber.Ctx) error {
 	owner, _ := getRealUser(c)
 	var sessions []models.AIChatSession
-	if err := h.DB.WithContext(c.Request.Context()).Where("user_id = ?", owner.ID).
+	if err := h.DB.WithContext(c.Context()).Where("user_id = ?", owner.ID).
 		Order("updated_at DESC").
 		Limit(chatSessionListLimit).
 		Find(&sessions).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat riwayat chat"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal memuat riwayat chat"})
+
 	}
-	c.JSON(http.StatusOK, gin.H{"sessions": sessions})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"sessions": sessions})
 }
 
 type chatTurn struct {
@@ -41,22 +41,22 @@ type chatTurn struct {
 }
 
 // GetChatSession membuka kembali satu percakapan beserta seluruh tanya-jawab dan dokumen yang dikutip.
-func (h *Handler) GetChatSession(c *gin.Context) {
+func (h *Handler) GetChatSession(c fiber.Ctx) error {
 	owner, _ := getRealUser(c)
 	var session models.AIChatSession
-	if err := h.DB.WithContext(c.Request.Context()).First(&session, "id = ? AND user_id = ?", c.Param("id"), owner.ID).Error; err != nil {
+	if err := h.DB.WithContext(c.Context()).First(&session, "id = ? AND user_id = ?", c.Params("id"), owner.ID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Riwayat chat tidak ditemukan"})
+			return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Riwayat chat tidak ditemukan"})
 		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat riwayat chat"})
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal memuat riwayat chat"})
 		}
-		return
+
 	}
 
 	var messages []models.AIChatMessage
-	if err := h.DB.WithContext(c.Request.Context()).Where("session_id = ?", session.ID).Order("id ASC").Find(&messages).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat riwayat chat"})
-		return
+	if err := h.DB.WithContext(c.Context()).Where("session_id = ?", session.ID).Order("id ASC").Find(&messages).Error; err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal memuat riwayat chat"})
+
 	}
 
 	turns := make([]chatTurn, 0, len(messages))
@@ -95,16 +95,16 @@ func (h *Handler) GetChatSession(c *gin.Context) {
 			CreatedAt: m.CreatedAt,
 		})
 	}
-	c.JSON(http.StatusOK, gin.H{"session": session, "messages": turns})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"session": session, "messages": turns})
 }
 
 // DeleteChatSession menghapus satu percakapan milik user beserta seluruh isinya.
-func (h *Handler) DeleteChatSession(c *gin.Context) {
+func (h *Handler) DeleteChatSession(c fiber.Ctx) error {
 	owner, _ := getRealUser(c)
-	sessionID := c.Param("id")
+	sessionID := c.Params("id")
 
 	found := false
-	err := h.DB.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+	err := h.DB.WithContext(c.Context()).Transaction(func(tx *gorm.DB) error {
 		res := tx.Where("id = ? AND user_id = ?", sessionID, owner.ID).Delete(&models.AIChatSession{})
 		if res.Error != nil {
 			return res.Error
@@ -116,14 +116,14 @@ func (h *Handler) DeleteChatSession(c *gin.Context) {
 		return tx.Where("session_id = ?", sessionID).Delete(&models.AIChatMessage{}).Error
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus riwayat chat"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menghapus riwayat chat"})
+
 	}
 	if !found {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Riwayat chat tidak ditemukan"})
-		return
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Riwayat chat tidak ditemukan"})
+
 	}
-	c.JSON(http.StatusOK, gin.H{"deleted": true})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"deleted": true})
 }
 
 func cleanDocShortTitle(doc models.Document) string {
@@ -270,7 +270,7 @@ func generateDynamicShortcuts(docs []models.Document, user models.User) []string
 // GetAIChatShortcuts menghasilkan daftar saran shortcut pertanyaan dinamis
 // yang disesuaikan secara cerdas berdasarkan dokumen yang boleh diakses pengguna saat ini.
 // Setiap pemanggilan / refresh menghasilkan variasi pertanyaan yang berbeda.
-func (h *Handler) GetAIChatShortcuts(c *gin.Context) {
+func (h *Handler) GetAIChatShortcuts(c fiber.Ctx) error {
 	user := getCurrentUser(c)
 
 	// Ambil dokumen yang boleh diakses user sesuai isolasi data Tim/Branch
@@ -283,10 +283,10 @@ func (h *Handler) GetAIChatShortcuts(c *gin.Context) {
 
 	var docs []models.Document
 	if err := query.Order("uploaded_at DESC").Limit(50).Find(&docs).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membaca dokumen"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal membaca dokumen"})
+
 	}
 
 	shortcuts := generateDynamicShortcuts(docs, user)
-	c.JSON(http.StatusOK, gin.H{"shortcuts": shortcuts})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"shortcuts": shortcuts})
 }

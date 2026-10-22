@@ -11,6 +11,30 @@ API pengelolaan dokumen audit TI: folder tim, aplikasi dan section versi, eviden
 - Hak perubahan skema pada database pengembangan untuk migrasi saat startup.
 - MinIO opsional. Tanpa kredensial lengkap, file baru disimpan di `uploads/`.
 - LLM dan reranker eksternal opsional; mode builtin dapat dipakai tanpa API key eksternal.
+- HTTP memakai GoFiber v3.6.1. Cancellation chat memerlukan Linux dengan listener TCP/TLS; platform/listener lain gagal eksplisit, bukan mengabaikan disconnect.
+
+### Lifecycle HTTP dan stream
+
+Handler memakai `func(fiber.Ctx) error`, validasi required tetap melalui validator yang sudah tersedia. Error HTTP berbentuk `{"error":"..."}`. CORS menggunakan Bearer header tanpa wildcard credentials.
+
+Chat JSON memakai context terpisah yang dibatalkan saat socket peer putus. Poll metadata socket setiap 10 ms tidak membaca/menulis byte TCP/TLS; ini bukan jaminan Stop 10 ms melewati proxy. SSE memakai middleware bawaan Fiber, heartbeat 15 detik, dan context socket yang sama. Callback menangkap request/identitas yang dimiliki sendiri; tidak meneruskan pooled Ctx ke service. `done` hanya dikirim setelah penyimpanan berhasil.
+
+Timeout server: read 30 detik, idle 60 detik, write 20 menit agar Thinking dan final generation tidak terpotong terlalu cepat. WriteTimeout merupakan ceiling seluruh respons, bukan idle timeout per chunk. Proxy harus mendukung respons lama dan meneruskan disconnect; smoke jalur deployment sebenarnya masih diperlukan.
+
+Batas body sebelum multipart parsing adalah `UPLOAD_MAX_MB` + overhead 1 MiB (default file 25 MiB). Setelah parsing, ukuran dan isi file diperiksa lagi. Download tetap streaming, termasuk Range tunggal/multipart, HEAD dan conditional request; reader ditutup oleh lifecycle respons.
+
+Verifikasi migrasi:
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+go build ./...
+go test -race -tags integration ./internal/service -run Integration -count=1
+go test -race ./internal/httptransport -count=10
+```
+
+Tes TCP/TLS dan reverse proxy lokal bukan bukti provider eksternal atau proxy produksi. Rollback pergantian framework melalui executable/revisi sebelumnya; tidak ada migrasi skema khusus Fiber.
 
 ## Mulai cepat
 

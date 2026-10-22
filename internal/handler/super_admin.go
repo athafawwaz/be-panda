@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v3"
 
 	"panda-backend/internal/models"
 	"panda-backend/internal/service"
@@ -14,14 +14,12 @@ import (
 
 // RequireSuperAdmin membatasi endpoint pengembangan (Setting API Key AI) hanya untuk Super Admin.
 // Saat impersonate, identitas efektif adalah Pegawai TI sehingga endpoint ini otomatis tertutup.
-func (h *Handler) RequireSuperAdmin() gin.HandlerFunc {
-	return func(c *gin.Context) {
+func (h *Handler) RequireSuperAdmin() fiber.Handler {
+	return func(c fiber.Ctx) error {
 		if getCurrentUser(c).Role != models.RoleSuperAdmin {
-			c.JSON(http.StatusForbidden, gin.H{"error": "Menu ini khusus Super Admin"})
-			c.Abort()
-			return
+			return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "Menu ini khusus Super Admin"})
 		}
-		c.Next()
+		return c.Next()
 	}
 }
 
@@ -47,7 +45,7 @@ type aiSettingsRequest struct {
 	ThinkingMaxSteps *int  `json:"thinking_max_steps"`
 }
 
-func aiSettingsPayload(cfg service.LLMConfig) gin.H {
+func aiSettingsPayload(cfg service.LLMConfig) fiber.Map {
 	engine := "Built-in Go Smart Document Agent (Zero API Key)"
 	toolCalling := false
 	if cfg.UsesExternalLLM() {
@@ -59,7 +57,7 @@ func aiSettingsPayload(cfg service.LLMConfig) gin.H {
 	} else if cfg.Provider != service.ProviderBuiltin {
 		engine = "PANDA Agent · API key belum diisi"
 	}
-	return gin.H{
+	return fiber.Map{
 		"provider":          cfg.Provider,
 		"base_url":          cfg.BaseURL,
 		"model":             cfg.Model,
@@ -81,8 +79,8 @@ func aiSettingsPayload(cfg service.LLMConfig) gin.H {
 	}
 }
 
-func (h *Handler) GetAISettings(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"settings": aiSettingsPayload(service.LoadLLMConfig(h.DB))})
+func (h *Handler) GetAISettings(c fiber.Ctx) error {
+	return c.Status(http.StatusOK).JSON(fiber.Map{"settings": aiSettingsPayload(service.LoadLLMConfig(h.DB))})
 }
 
 func validateAISettings(req aiSettingsRequest) string {
@@ -110,16 +108,16 @@ func validateAISettings(req aiSettingsRequest) string {
 	return ""
 }
 
-func (h *Handler) UpdateAISettings(c *gin.Context) {
+func (h *Handler) UpdateAISettings(c fiber.Ctx) error {
 	actor := getCurrentUser(c)
 	var req aiSettingsRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Format setting AI tidak valid"})
-		return
+	if err := c.Bind().JSON(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Format setting AI tidak valid"})
+
 	}
 	if msg := validateAISettings(req); msg != "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": msg})
+
 	}
 
 	err := service.SaveLLMConfig(h.DB, service.LLMConfigUpdate{
@@ -133,8 +131,8 @@ func (h *Handler) UpdateAISettings(c *gin.Context) {
 		ThinkingMaxSteps: req.ThinkingMaxSteps,
 	}, actor.BadgeNumber)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan setting AI"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menyimpan setting AI"})
+
 	}
 
 	keyAction := "API key tidak diubah"
@@ -161,13 +159,13 @@ func (h *Handler) UpdateAISettings(c *gin.Context) {
 		ActionTimestamp: time.Now(),
 	})
 
-	c.JSON(http.StatusOK, gin.H{"settings": aiSettingsPayload(cfg)})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"settings": aiSettingsPayload(cfg)})
 }
 
 // TestAISettings menguji koneksi memakai nilai di form (bila diisi) atau setting tersimpan.
-func (h *Handler) TestAISettings(c *gin.Context) {
+func (h *Handler) TestAISettings(c fiber.Ctx) error {
 	var req aiSettingsRequest
-	_ = c.ShouldBindJSON(&req)
+	_ = c.Bind().JSON(&req)
 
 	cfg := service.LoadLLMConfig(h.DB)
 	if p := strings.ToLower(strings.TrimSpace(req.Provider)); p != "" {
@@ -184,29 +182,29 @@ func (h *Handler) TestAISettings(c *gin.Context) {
 	}
 
 	if cfg.Provider == service.ProviderBuiltin {
-		c.JSON(http.StatusOK, gin.H{"ok": true, "message": "Mode Built-in Agent aktif — tidak memerlukan koneksi ke LLM eksternal."})
-		return
+		return c.Status(http.StatusOK).JSON(fiber.Map{"ok": true, "message": "Mode Built-in Agent aktif — tidak memerlukan koneksi ke LLM eksternal."})
+
 	}
 	if msg := validateAISettings(aiSettingsRequest{Provider: cfg.Provider, BaseURL: cfg.BaseURL, Model: cfg.Model}); msg != "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": msg})
+
 	}
 	if cfg.APIKey == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "API key belum diisi"})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "API key belum diisi"})
+
 	}
 
 	start := time.Now()
 	reply, err := service.TestLLMConnection(cfg)
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"ok": false, "message": err.Error(), "latency_ms": latency})
-		return
+		return c.Status(http.StatusOK).JSON(fiber.Map{"ok": false, "message": err.Error(), "latency_ms": latency})
+
 	}
 	if len(reply) > 200 {
 		reply = reply[:200] + "…"
 	}
-	c.JSON(http.StatusOK, gin.H{
+	return c.Status(http.StatusOK).JSON(fiber.Map{
 		"ok":         true,
 		"message":    fmt.Sprintf("Terhubung ke %s (%s)", cfg.BaseURL, cfg.Model),
 		"reply":      reply,

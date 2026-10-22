@@ -7,8 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v3"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/valyala/fasthttp"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
@@ -31,8 +32,8 @@ func TestMiddlewareRejectsInvalidCredentials(t *testing.T) {
 		{name: "wrong algorithm", method: jwt.SigningMethodHS512, claims: jwt.MapClaims{"exp": time.Now().Add(time.Hour).Unix()}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := gin.New()
-			r.GET("/protected", h.AuthMiddleware(), func(c *gin.Context) { t.Error("unauthorized request reached handler") })
+			r := fiber.New(HTTPConfig())
+			r.Get("/protected", h.AuthMiddleware(), func(c fiber.Ctx) error { t.Error("unauthorized request reached handler"); return nil })
 			req := httptest.NewRequest(http.MethodGet, "/protected", nil)
 			if tc.query {
 				req.URL.RawQuery = "token=untrusted"
@@ -43,8 +44,7 @@ func TestMiddlewareRejectsInvalidCredentials(t *testing.T) {
 				}
 				req.Header.Set("Authorization", "Bearer "+token)
 			}
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
+			w := testHTTP(t, r, req)
 			if w.Code != http.StatusUnauthorized {
 				t.Fatalf("got %d, want 401", w.Code)
 			}
@@ -85,16 +85,16 @@ func TestApplicationHandlersRejectOtherSegments(t *testing.T) {
 					t.Fatal(err)
 				}
 				h := &Handler{DB: db}
-				r := gin.New()
-				r.Use(func(c *gin.Context) {
-					c.Set("currentUser", models.User{Role: models.RolePegawaiTI, TeamID: &team, BranchID: &branch})
+				r := fiber.New(HTTPConfig())
+				r.Use(func(c fiber.Ctx) error {
+					c.Locals("currentUser", models.User{Role: models.RolePegawaiTI, TeamID: &team, BranchID: &branch})
+					return c.Next()
 				})
-				r.GET("/applications/:id", h.GetApplicationDetail)
-				r.POST("/applications/:id", h.CreateAppSection)
+				r.Get("/applications/:id", h.GetApplicationDetail)
+				r.Post("/applications/:id", h.CreateAppSection)
 				req := httptest.NewRequest(method, "/applications/foreign-app", strings.NewReader(`{"version_label":"v2","section_title":"Forbidden"}`))
 				req.Header.Set("Content-Type", "application/json")
-				w := httptest.NewRecorder()
-				r.ServeHTTP(w, req)
+				w := testHTTP(t, r, req)
 				if w.Code != http.StatusNotFound {
 					t.Fatalf("got %d, want 404; %s", w.Code, w.Body.String())
 				}
@@ -125,10 +125,12 @@ func TestDocumentAndAuditScopes(t *testing.T) {
 				}
 			}
 			for _, impersonating := range []bool{false, true} {
-				c, _ := gin.CreateTestContext(httptest.NewRecorder())
-				c.Set("currentUser", tc.user)
+				app := fiber.New(HTTPConfig())
+				c := app.AcquireCtx(&fasthttp.RequestCtx{})
+				defer app.ReleaseCtx(c)
+				c.Locals("currentUser", tc.user)
 				if impersonating {
-					c.Set("realUser", models.User{Role: models.RoleSuperAdmin})
+					c.Locals("realUser", models.User{Role: models.RoleSuperAdmin})
 				}
 				h := &Handler{DB: db}
 				sql = db.ToSQL(func(tx *gorm.DB) *gorm.DB {
