@@ -13,7 +13,7 @@ import (
 )
 
 // Dukungan tool calling OpenAI-compatible (/chat/completions dengan "tools"). Fungsi teks biasa di llm_client.go
-// tetap dipakai fitur lain (analisis upload, agen JSON lama) dan tidak berubah.
+// tetap dipakai fitur lain (analisis upload dan tes koneksi).
 
 // toolDef adalah satu tool yang ditawarkan ke model (format OpenAI "tools").
 type toolDef struct {
@@ -88,7 +88,7 @@ type toolChatRequest struct {
 	Timeout     time.Duration
 }
 
-// ErrToolsUnsupported: provider menolak parameter tools/tool_choice, sehingga agen perlu memakai protokol JSON lama.
+// ErrToolsUnsupported: provider menolak tools/tool_choice; agent melaporkan error tanpa protokol pengganti.
 type ErrToolsUnsupported struct{ Cause error }
 
 func (e *ErrToolsUnsupported) Error() string {
@@ -171,6 +171,7 @@ func (r rawToolCall) argumentsText() string {
 }
 
 type toolResponseBody struct {
+	Error   json.RawMessage `json:"error"`
 	Choices []struct {
 		Message struct {
 			Content   *string       `json:"content"`
@@ -267,23 +268,33 @@ func chatCompletionTools(ctx context.Context, cfg LLMConfig, req toolChatRequest
 	resp, err := postChat(ctx, cfg, toolChatPayload(cfg, req, false), req.Timeout)
 	if err != nil {
 		recordLLMUsage(cfg, 0, 0, 0, err)
-		return toolChatResult{}, err
+		return toolChatResult{Usage: LLMUsage{Calls: 1}}, err
 	}
 	defer resp.Body.Close()
-	respBytes, _ := io.ReadAll(resp.Body)
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		recordLLMUsage(cfg, resp.StatusCode, 0, 0, err)
+		return toolChatResult{Usage: LLMUsage{Calls: 1}}, fmt.Errorf("read LLM response: %w", err)
+	}
 	if resp.StatusCode >= 300 {
 		llmErr := &LLMError{Status: resp.StatusCode, Body: string(respBytes)}
 		recordLLMUsage(cfg, resp.StatusCode, 0, 0, llmErr)
-		return toolChatResult{}, classifyToolsError(llmErr)
+		return toolChatResult{Usage: LLMUsage{Calls: 1}}, classifyToolsError(llmErr)
 	}
 	return parseToolResponse(cfg, resp.StatusCode, respBytes, req.Messages, nil)
 }
 
 func parseToolResponse(cfg LLMConfig, status int, respBytes []byte, msgs []chatMessage, onDelta func(string)) (toolChatResult, error) {
 	var parsed toolResponseBody
-	if err := json.Unmarshal(respBytes, &parsed); err != nil || len(parsed.Choices) == 0 {
-		recordLLMUsage(cfg, status, 0, 0, nil)
-		return toolChatResult{Usage: LLMUsage{Calls: 1}}, fmt.Errorf("invalid LLM response")
+	decodeErr := json.Unmarshal(respBytes, &parsed)
+	if decodeErr != nil || (len(parsed.Error) > 0 && string(parsed.Error) != "null") || len(parsed.Choices) == 0 {
+		err := errors.New("invalid LLM response")
+		if decodeErr == nil && len(parsed.Error) > 0 && string(parsed.Error) != "null" {
+			err = errors.New("LLM provider returned an error")
+		}
+		usage := toolUsage(&parsed, msgs, "", nil)
+		recordLLMUsage(cfg, status, usage.PromptTokens, usage.CompletionTokens, err)
+		return toolChatResult{Usage: usage}, err
 	}
 	choice := parsed.Choices[0]
 	var acc toolCallAccumulator
@@ -297,10 +308,15 @@ func parseToolResponse(cfg LLMConfig, status int, respBytes []byte, msgs []chatM
 	if choice.FinishReason != nil {
 		res.FinishReason = *choice.FinishReason
 	}
+	res.Usage = toolUsage(&parsed, msgs, res.Content, res.ToolCalls)
+	if res.FinishReason == "length" && len(res.ToolCalls) > 0 {
+		err := errors.New("LLM tool calls truncated by token limit")
+		recordLLMUsage(cfg, status, res.Usage.PromptTokens, res.Usage.CompletionTokens, err)
+		return toolChatResult{Usage: res.Usage}, err
+	}
 	if onDelta != nil && res.Content != "" {
 		onDelta(res.Content)
 	}
-	res.Usage = toolUsage(&parsed, msgs, res.Content, res.ToolCalls)
 	recordLLMUsage(cfg, status, res.Usage.PromptTokens, res.Usage.CompletionTokens, nil)
 	return res, nil
 }
@@ -313,30 +329,42 @@ func chatCompletionStreamTools(ctx context.Context, cfg LLMConfig, req toolChatR
 	payload := toolChatPayload(cfg, req, true)
 	resp, err := postChat(ctx, cfg, payload, req.Timeout)
 	if err == nil && resp.StatusCode == http.StatusBadRequest {
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if readErr != nil {
+			recordLLMUsage(cfg, resp.StatusCode, 0, 0, readErr)
+			return toolChatResult{Usage: LLMUsage{Calls: 1}}, fmt.Errorf("read LLM response: %w", readErr)
+		}
 		if !strings.Contains(strings.ToLower(string(body)), "stream_options") {
 			llmErr := &LLMError{Status: resp.StatusCode, Body: string(body)}
 			recordLLMUsage(cfg, resp.StatusCode, 0, 0, llmErr)
-			return toolChatResult{}, classifyToolsError(llmErr)
+			return toolChatResult{Usage: LLMUsage{Calls: 1}}, classifyToolsError(llmErr)
 		}
 		delete(payload, "stream_options")
 		resp, err = postChat(ctx, cfg, payload, req.Timeout)
 	}
 	if err != nil {
 		recordLLMUsage(cfg, 0, 0, 0, err)
-		return toolChatResult{}, err
+		return toolChatResult{Usage: LLMUsage{Calls: 1}}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		respBytes, _ := io.ReadAll(resp.Body)
+		respBytes, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			recordLLMUsage(cfg, resp.StatusCode, 0, 0, readErr)
+			return toolChatResult{Usage: LLMUsage{Calls: 1}}, fmt.Errorf("read LLM response: %w", readErr)
+		}
 		llmErr := &LLMError{Status: resp.StatusCode, Body: string(respBytes)}
 		recordLLMUsage(cfg, resp.StatusCode, 0, 0, llmErr)
-		return toolChatResult{}, classifyToolsError(llmErr)
+		return toolChatResult{Usage: LLMUsage{Calls: 1}}, classifyToolsError(llmErr)
 	}
 	if !strings.Contains(resp.Header.Get("Content-Type"), "event-stream") {
-		respBytes, _ := io.ReadAll(resp.Body)
+		respBytes, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			recordLLMUsage(cfg, resp.StatusCode, 0, 0, readErr)
+			return toolChatResult{Usage: LLMUsage{Calls: 1}}, fmt.Errorf("read LLM response: %w", readErr)
+		}
 		res, err := parseToolResponse(cfg, resp.StatusCode, respBytes, req.Messages, onDelta)
 		if err == nil && onToolStart != nil {
 			for _, c := range res.ToolCalls {
@@ -350,6 +378,8 @@ func chatCompletionStreamTools(ctx context.Context, cfg LLMConfig, req toolChatR
 	var acc toolCallAccumulator
 	var last *toolResponseBody
 	finish := ""
+	done := false
+	var streamErr error
 	announced := map[int]bool{}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -360,15 +390,30 @@ func chatCompletionStreamTools(ctx context.Context, cfg LLMConfig, req toolChatR
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			done = true
 			break
 		}
 		var chunk toolResponseBody
-		if json.Unmarshal([]byte(data), &chunk) != nil {
-			continue
-		}
+		decodeErr := json.Unmarshal([]byte(data), &chunk)
 		if chunk.Usage != nil {
 			c := chunk
 			last = &c
+		}
+		if decodeErr != nil {
+			streamErr = errors.New("invalid LLM stream response")
+			break
+		}
+		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+			streamErr = errors.New("LLM provider returned an error")
+			break
+		}
+		if len(chunk.Choices) == 0 && chunk.Usage == nil {
+			var metadata map[string]json.RawMessage
+			if json.Unmarshal([]byte(data), &metadata) == nil && metadata["prompt_filter_results"] != nil {
+				continue // Azure mengirim metadata filter sebelum delta pilihan.
+			}
+			streamErr = errors.New("invalid LLM stream response")
+			break
 		}
 		for _, c := range chunk.Choices {
 			if c.Delta.Content != nil && *c.Delta.Content != "" {
@@ -393,13 +438,22 @@ func chatCompletionStreamTools(ctx context.Context, cfg LLMConfig, req toolChatR
 			}
 		}
 	}
-	calls := acc.finish()
-	if err := scanner.Err(); err != nil && sb.Len() == 0 && len(calls) == 0 {
-		recordLLMUsage(cfg, resp.StatusCode, 0, 0, err)
-		return toolChatResult{Usage: LLMUsage{Calls: 1}}, err
+	res := toolChatResult{Content: sb.String(), ToolCalls: acc.finish(), FinishReason: finish}
+	res.Usage = toolUsage(last, req.Messages, res.Content, res.ToolCalls)
+	switch {
+	case ctx.Err() != nil:
+		streamErr = ctx.Err()
+	case scanner.Err() != nil:
+		streamErr = fmt.Errorf("read LLM stream: %w", scanner.Err())
+	case streamErr != nil:
+	case !done && finish == "":
+		streamErr = fmt.Errorf("LLM stream ended without completion: %w", io.ErrUnexpectedEOF)
+	case finish == "length" && len(res.ToolCalls) > 0:
+		streamErr = errors.New("LLM tool calls truncated by token limit")
 	}
-	res := toolChatResult{Content: sb.String(), ToolCalls: calls, FinishReason: finish}
-	res.Usage = toolUsage(last, req.Messages, res.Content, calls)
-	recordLLMUsage(cfg, resp.StatusCode, res.Usage.PromptTokens, res.Usage.CompletionTokens, nil)
+	recordLLMUsage(cfg, resp.StatusCode, res.Usage.PromptTokens, res.Usage.CompletionTokens, streamErr)
+	if streamErr != nil {
+		return toolChatResult{Usage: res.Usage}, streamErr
+	}
 	return res, nil
 }

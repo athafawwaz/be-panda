@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -210,5 +211,189 @@ func TestThoughtSignatureErrorIsNotToolsUnsupported(t *testing.T) {
 	var unsupported *ErrToolsUnsupported
 	if err == nil || errors.As(err, &unsupported) {
 		t.Fatalf("error validasi tool call bukan tanda provider tanpa tools: %v", err)
+	}
+}
+
+func TestChatCompletionStreamToolsRejectsIncompleteOrInvalidStream(t *testing.T) {
+	partial := `{"choices":[{"delta":{"content":"partial text","tool_calls":[{"index":0,"id":"c1","function":{"name":"search_documents","arguments":"{\"query\":"}}]}}]}`
+	usage := `{"choices":[],"usage":{"prompt_tokens":17,"completion_tokens":3}}`
+	for _, tc := range []struct {
+		name, tail, want string
+		unexpectedEOF    bool
+	}{
+		{"truncated content and calls", "", "without completion", true},
+		{"malformed JSON", "data: {broken secret-provider-data}\n\n", "invalid LLM stream response", false},
+		{"malformed after finish", "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\ndata: {broken secret-provider-data}\n\n", "invalid LLM stream response", false},
+		{"wrong JSON type", "data: {\"choices\":\"secret-provider-data\"}\n\n", "invalid LLM stream response", false},
+		{"wrong JSON type with usage", "data: {\"choices\":\"secret-provider-data\",\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":3}}\n\n", "invalid LLM stream response", false},
+		{"error envelope", "data: {\"error\":{\"message\":\"secret-provider-data\"}}\n\n", "LLM provider returned an error", false},
+		{"error envelope with usage", "data: {\"error\":\"secret-provider-data\",\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":3}}\n\n", "LLM provider returned an error", false},
+		{"error with choices", "data: {\"error\":\"secret-provider-data\",\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n", "LLM provider returned an error", false},
+		{"empty object", "data: {}\n\n", "invalid LLM stream response", false},
+		{"token limit", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", "tool calls truncated by token limit", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testLLMServer(t, func(w http.ResponseWriter, _ map[string]any) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprintf(w, "data: %s\n\ndata: %s\n\n%s", partial, usage, tc.tail)
+			})
+			res, err := chatCompletionStreamTools(context.Background(), cfg, toolReq(textMessage("user", "x")), nil, nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), "secret-provider-data") {
+				t.Fatalf("want safe %q error, got %v", tc.want, err)
+			}
+			if tc.unexpectedEOF && !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("want unexpected EOF, got %v", err)
+			}
+			if res.Content != "" || len(res.ToolCalls) != 0 || res.Usage.Calls != 1 || res.Usage.TotalTokens != 20 || res.Usage.Estimated {
+				t.Fatalf("failure must retain usage, not executable partial output: %+v", res)
+			}
+		})
+	}
+}
+
+func TestChatCompletionStreamToolsCompletionSignals(t *testing.T) {
+	for _, tc := range []struct {
+		name, delta, tail string
+		wantErr           bool
+	}{
+		{"content EOF", `{"content":"hello"}`, "", true},
+		{"calls EOF", `{"tool_calls":[{"function":{"name":"list_documents","arguments":"{}"}}]}`, "", true},
+		{"empty EOF", `{}`, "", true},
+		{"DONE only", `{"content":"hello"}`, "data: [DONE]\n\n", false},
+		{"finish only", `{"content":"hello"}`, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n", false},
+		{"tool finish only", `{"tool_calls":[{"function":{"name":"list_documents","arguments":"{}"}}]}`, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n", false},
+		{"length content only", `{"content":"hello"}`, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testLLMServer(t, func(w http.ResponseWriter, _ map[string]any) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":%s}]}\n\n%s", tc.delta, tc.tail)
+			})
+			res, err := chatCompletionStreamTools(context.Background(), cfg, toolReq(textMessage("user", "hello")), nil, nil)
+			if (err != nil) != tc.wantErr || res.Usage.Calls != 1 {
+				t.Fatalf("result=%+v err=%v", res, err)
+			}
+			if tc.wantErr && (res.Content != "" || len(res.ToolCalls) != 0 || !errors.Is(err, io.ErrUnexpectedEOF)) {
+				t.Fatalf("incomplete result accepted: %+v err=%v", res, err)
+			}
+			if !tc.wantErr && res.Content == "" && len(res.ToolCalls) == 0 {
+				t.Fatalf("complete result lost: %+v", res)
+			}
+		})
+	}
+}
+
+func TestChatCompletionStreamToolsScannerErrorsDiscardPartialCalls(t *testing.T) {
+	for _, tc := range []struct {
+		name, tail string
+		shortBody  bool
+	}{
+		{"unexpected EOF", "", true},
+		{"unexpected EOF after finish", "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n", true},
+		{"scanner token too long", "data: " + strings.Repeat("x", 1024*1024) + "\n\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testLLMServer(t, func(w http.ResponseWriter, _ map[string]any) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if tc.shortBody {
+					w.Header().Set("Content-Length", "999999")
+				}
+				fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"partial text","tool_calls":[{"function":{"name":"list_documents","arguments":"{}"}}]}}]}`+"\n\n"+tc.tail)
+			})
+			res, err := chatCompletionStreamTools(context.Background(), cfg, toolReq(textMessage("user", "hello")), nil, nil)
+			if err == nil || !strings.Contains(err.Error(), "read LLM stream") || (tc.shortBody && !errors.Is(err, io.ErrUnexpectedEOF)) {
+				t.Fatalf("scanner error not propagated: %v", err)
+			}
+			if len(res.ToolCalls) != 0 || res.Content != "" || res.Usage.Calls != 1 || res.Usage.CompletionTokens == 0 {
+				t.Fatalf("partial calls returned or usage lost: %+v", res)
+			}
+		})
+	}
+}
+
+func TestChatCompletionStreamToolsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release := make(chan struct{})
+	cfg := testLLMServer(t, func(w http.ResponseWriter, _ map[string]any) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"partial text","tool_calls":[{"function":{"name":"list_documents","arguments":"{}"}}]}}]}`+"\n\n")
+		w.(http.Flusher).Flush()
+		<-release
+	})
+	defer close(release)
+	res, err := chatCompletionStreamTools(ctx, cfg, toolReq(textMessage("user", "hello")), func(string) { cancel() }, nil)
+	if !errors.Is(err, context.Canceled) || res.Content != "" || len(res.ToolCalls) != 0 || res.Usage.Calls != 1 || res.Usage.CompletionTokens == 0 {
+		t.Fatalf("cancellation must discard partial calls and retain usage: %+v err=%v", res, err)
+	}
+}
+
+func TestChatCompletionToolsBodyReadErrors(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, status := range []int{http.StatusOK, http.StatusBadRequest, http.StatusInternalServerError} {
+			t.Run(fmt.Sprintf("stream=%v/status=%d", stream, status), func(t *testing.T) {
+				calls := 0
+				cfg := testLLMServer(t, func(w http.ResponseWriter, _ map[string]any) {
+					calls++
+					w.Header().Set("Content-Length", "999999")
+					w.WriteHeader(status)
+					if status == http.StatusOK {
+						fmt.Fprint(w, `{"choices":[{"message":{"tool_calls":[{"function":{"name":"list_documents","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
+					} else {
+						fmt.Fprint(w, `{"error":"unknown field stream_options"}`)
+					}
+				})
+				var res toolChatResult
+				var err error
+				if stream {
+					res, err = chatCompletionStreamTools(context.Background(), cfg, toolReq(textMessage("user", "x")), nil, nil)
+				} else {
+					res, err = chatCompletionTools(context.Background(), cfg, toolReq(textMessage("user", "x")))
+				}
+				if !errors.Is(err, io.ErrUnexpectedEOF) || len(res.ToolCalls) != 0 || res.Usage.Calls != 1 || calls != 1 {
+					t.Fatalf("read error must win, without retry/partial calls: result=%+v calls=%d err=%v", res, calls, err)
+				}
+			})
+		}
+	}
+}
+
+func TestChatCompletionToolsRejectsInvalidPlainJSON(t *testing.T) {
+	for _, body := range []string{
+		`{"choices":`,
+		`{"error":{"message":"secret-provider-data"}}`,
+		`{"error":"secret-provider-data","choices":[{"message":{"content":"ignored"}}],"usage":{"prompt_tokens":17,"completion_tokens":3}}`,
+		`{"choices":[{"message":{"tool_calls":[{"function":{"name":"list_documents","arguments":"{"}}]},"finish_reason":"length"}],"usage":{"prompt_tokens":17,"completion_tokens":3}}`,
+	} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%v/body=%s", stream, body), func(t *testing.T) {
+				cfg := testLLMServer(t, func(w http.ResponseWriter, _ map[string]any) { fmt.Fprint(w, body) })
+				var res toolChatResult
+				var err error
+				if stream {
+					res, err = chatCompletionStreamTools(context.Background(), cfg, toolReq(textMessage("user", "x")), func(string) { t.Error("invalid response emitted content") }, nil)
+				} else {
+					res, err = chatCompletionTools(context.Background(), cfg, toolReq(textMessage("user", "x")))
+				}
+				if err == nil || strings.Contains(err.Error(), "secret-provider-data") || len(res.ToolCalls) != 0 || res.Content != "" || res.Usage.Calls != 1 {
+					t.Fatalf("invalid response accepted or unsafe error: %+v err=%v", res, err)
+				}
+				if strings.Contains(body, `"usage"`) && res.Usage.TotalTokens != 20 {
+					t.Fatalf("reported usage lost: %+v", res.Usage)
+				}
+			})
+		}
+	}
+}
+
+func TestChatCompletionStreamToolsAcceptsAzureFilterMetadata(t *testing.T) {
+	cfg := testLLMServer(t, func(w http.ResponseWriter, body map[string]any) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[],"prompt_filter_results":[{"prompt_index":0,"content_filter_results":{}}]}`+"\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	})
+	res, err := chatCompletionStreamTools(context.Background(), cfg, toolReq(textMessage("user", "x")), nil, nil)
+	if err != nil || res.Content != "ok" {
+		t.Fatalf("valid filter metadata rejected: %+v %v", res, err)
 	}
 }
