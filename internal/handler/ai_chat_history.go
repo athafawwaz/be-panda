@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -9,102 +10,19 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 
 	"panda-backend/internal/models"
 	"panda-backend/internal/service"
 )
 
-const (
-	chatTitleMaxRunes    = 80
-	chatSessionListLimit = 100
-)
-
-// chatTitle membuat judul percakapan dari pertanyaan pertama.
-func chatTitle(prompt string) string {
-	title := []rune(strings.Join(strings.Fields(prompt), " "))
-	if len(title) > chatTitleMaxRunes {
-		return string(title[:chatTitleMaxRunes]) + "…"
-	}
-	return string(title)
-}
-
-// replyExcerptRunes: panjang cuplikan pesan yang dibalas/diteruskan yang disimpan untuk ditampilkan di riwayat.
-const replyExcerptRunes = 300
-
-// saveChatTurn menyimpan satu tanya-jawab Agentic AI (beserta langkah AI & pesan yang dibalas) ke riwayat chat
-// milik owner. Sesi baru dibuat bila sessionID kosong atau bukan milik owner; id sesi & id pesan dikembalikan.
-func (h *Handler) saveChatTurn(owner models.User, sessionID string, req service.AIChatRequest, resp *service.AIChatResponse) (string, int64, error) {
-	now := time.Now().UTC()
-	docsJSON, err := json.Marshal(resp.MatchedDocuments)
-	if err != nil {
-		return "", 0, err
-	}
-	traceJSON := ""
-	if resp.Trace != nil {
-		if b, err := json.Marshal(resp.Trace); err == nil {
-			traceJSON = string(b)
-		}
-	}
-	replyJSON := ""
-	if req.ReplyTo != nil {
-		ref := *req.ReplyTo
-		if r := []rune(strings.TrimSpace(ref.Text)); len(r) > replyExcerptRunes {
-			ref.Text = string(r[:replyExcerptRunes]) + "…"
-		}
-		if b, err := json.Marshal(ref); err == nil {
-			replyJSON = string(b)
-		}
-	}
-	var messageID int64
-
-	err = h.DB.Transaction(func(tx *gorm.DB) error {
-		var session models.AIChatSession
-		if sessionID == "" || tx.First(&session, "id = ? AND user_id = ?", sessionID, owner.ID).Error != nil {
-			session = models.AIChatSession{
-				ID:        uuid.NewString(),
-				UserID:    owner.ID,
-				Title:     chatTitle(req.Prompt),
-				CreatedAt: now,
-				UpdatedAt: now,
-			}
-			if err := tx.Create(&session).Error; err != nil {
-				return err
-			}
-		}
-		sessionID = session.ID
-
-		msg := models.AIChatMessage{
-			SessionID:            session.ID,
-			Prompt:               req.Prompt,
-			FilterModule:         req.FilterModule,
-			ReplyMarkdown:        resp.ReplyMarkdown,
-			EngineMode:           resp.EngineMode,
-			ScopeLabel:           resp.ScopeLabel,
-			MatchedDocumentsJSON: string(docsJSON),
-			TraceJSON:            traceJSON,
-			ReplyToJSON:          replyJSON,
-			AnswerBasis:          resp.AnswerBasis,
-			CreatedAt:            now,
-		}
-		if err := tx.Create(&msg).Error; err != nil {
-			return err
-		}
-		messageID = msg.ID
-		return tx.Model(&models.AIChatSession{}).Where("id = ?", session.ID).Updates(map[string]interface{}{
-			"updated_at":    now,
-			"message_count": gorm.Expr("message_count + 1"),
-		}).Error
-	})
-	return sessionID, messageID, err
-}
+const chatSessionListLimit = 100
 
 // GetChatSessions menampilkan daftar percakapan Agentic AI milik user yang login, terbaru di atas.
 func (h *Handler) GetChatSessions(c *gin.Context) {
 	owner, _ := getRealUser(c)
 	var sessions []models.AIChatSession
-	if err := h.DB.Where("user_id = ?", owner.ID).
+	if err := h.DB.WithContext(c.Request.Context()).Where("user_id = ?", owner.ID).
 		Order("updated_at DESC").
 		Limit(chatSessionListLimit).
 		Find(&sessions).Error; err != nil {
@@ -126,13 +44,20 @@ type chatTurn struct {
 func (h *Handler) GetChatSession(c *gin.Context) {
 	owner, _ := getRealUser(c)
 	var session models.AIChatSession
-	if err := h.DB.First(&session, "id = ? AND user_id = ?", c.Param("id"), owner.ID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Riwayat chat tidak ditemukan"})
+	if err := h.DB.WithContext(c.Request.Context()).First(&session, "id = ? AND user_id = ?", c.Param("id"), owner.ID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Riwayat chat tidak ditemukan"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat riwayat chat"})
+		}
 		return
 	}
 
 	var messages []models.AIChatMessage
-	h.DB.Where("session_id = ?", session.ID).Order("id ASC").Find(&messages)
+	if err := h.DB.WithContext(c.Request.Context()).Where("session_id = ?", session.ID).Order("id ASC").Find(&messages).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat riwayat chat"})
+		return
+	}
 
 	turns := make([]chatTurn, 0, len(messages))
 	for _, m := range messages {
@@ -179,7 +104,7 @@ func (h *Handler) DeleteChatSession(c *gin.Context) {
 	sessionID := c.Param("id")
 
 	found := false
-	err := h.DB.Transaction(func(tx *gorm.DB) error {
+	err := h.DB.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
 		res := tx.Where("id = ? AND user_id = ?", sessionID, owner.ID).Delete(&models.AIChatSession{})
 		if res.Error != nil {
 			return res.Error

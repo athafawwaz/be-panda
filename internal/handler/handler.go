@@ -1,15 +1,12 @@
 package handler
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -149,21 +146,7 @@ func getRealUser(c *gin.Context) (models.User, bool) {
 	return getCurrentUser(c), false
 }
 
-func formatUserTeamLabel(u models.User) string {
-	switch u.Role {
-	case models.RoleSuperAdmin:
-		return "Super Admin (Semua Tim)"
-	case models.RoleAdmin:
-		return "Administrator (Semua Tim)"
-	}
-	if u.Team != nil && u.Branch != nil {
-		return fmt.Sprintf("%s • %s", u.Team.TeamName, u.Branch.BranchName)
-	}
-	if u.Team != nil {
-		return u.Team.TeamName
-	}
-	return "Pegawai TI"
-}
+func formatUserTeamLabel(u models.User) string { return service.UserTeamLabel(u) }
 
 // ─── Public Landing Page Stats ───────────────────────────────────────────────
 
@@ -764,161 +747,4 @@ func (h *Handler) GetUploadLogs(c *gin.Context) {
 	var logs []models.UploadAuditLog
 	query.Order("action_timestamp DESC").Limit(100).Find(&logs)
 	c.JSON(http.StatusOK, gin.H{"logs": logs})
-}
-
-// ─── Agentic AI Chat Endpoint (Team-Scoped RAG) ──────────────────────────────
-
-func (h *Handler) AgenticAIChat(c *gin.Context) {
-	user := getCurrentUser(c)
-	var req service.AIChatRequest
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Prompt) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Pertanyaan / Prompt tidak boleh kosong"})
-		return
-	}
-
-	// Riwayat percakapan dibaca dari sesi milik akun asli (pemilik riwayat chat); jumlahnya diatur di Docs → API Key
-	actor, impersonating := getRealUser(c)
-
-	resp, err := service.AnswerAgenticQuery(c.Request.Context(), h.DB, user, req, actor.ID, nil)
-	if err != nil {
-		log.Printf("[Agentic AI] gagal: %v", err)
-		var agentErr *service.AgentError
-		if errors.As(err, &agentErr) {
-			c.JSON(http.StatusBadGateway, gin.H{"error": agentErr.Message})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memproses pencarian Agentic AI"})
-		}
-		return
-	}
-	if c.Request.Context().Err() != nil {
-		return
-	}
-	h.recordAgenticChat(c.Request.Context(), user, actor, impersonating, req, resp)
-	c.JSON(http.StatusOK, resp)
-}
-
-// recordAgenticChat mencatat pencarian Agentic AI di log audit dan menyimpannya ke riwayat chat milik user.
-func (h *Handler) recordAgenticChat(ctx context.Context, user, actor models.User, impersonating bool, req service.AIChatRequest, resp *service.AIChatResponse) {
-	if ctx.Err() != nil {
-		return
-	}
-	scoped := *h
-	scoped.DB = h.DB.WithContext(ctx)
-	h = &scoped
-	// Saat impersonate, log dicatat atas identitas asli Super Admin agar tidak tercampur ke log segmen
-	mode := ""
-	if req.Thinking && resp.Trace != nil {
-		mode = fmt.Sprintf(" [Thinking: %d pencarian, %d token]", resp.Trace.Searches, resp.Trace.Usage.TotalTokens)
-	}
-	detail := fmt.Sprintf("%s (Badge %s) mencari di Agentic AI: \"%s\" (%d dokumen ditemukan)%s", actor.FullName, actor.BadgeNumber, req.Prompt, len(resp.MatchedDocuments), mode)
-	if impersonating {
-		detail += fmt.Sprintf(" [impersonate sebagai %s]", formatUserTeamLabel(user))
-	}
-
-	h.DB.Create(&models.UploadAuditLog{
-		BadgeNumber:        actor.BadgeNumber,
-		UserName:           actor.FullName,
-		UserRole:           actor.Role,
-		TeamAndBranchLabel: formatUserTeamLabel(actor),
-		ActionType:         "AI_SEARCH",
-		ModuleSource:       "AGENTIC_AI",
-		VisibilityLabel:    resp.ScopeLabel,
-		DetailDescription:  truncateUTF8(detail, 1000),
-		ActionTimestamp:    time.Now(),
-	})
-
-	// Simpan ke riwayat chat milik user. Saat impersonate (mode pratinjau read-only) tidak disimpan
-	// agar riwayat Super Admin tidak tercampur dengan hasil pencarian segmen lain.
-	if !impersonating {
-		if sessionID, messageID, err := h.saveChatTurn(actor, req.SessionID, req, resp); err != nil {
-			log.Printf("[Agentic AI] gagal menyimpan riwayat chat: %v", err)
-		} else {
-			resp.SessionID, resp.MessageID = sessionID, messageID
-		}
-	}
-}
-
-// AgenticAIChatStream menjawab pertanyaan Agentic AI sambil mengirim progres lewat Server-Sent Events:
-// "step" (langkah AI: menimbang, mencari, membaca, menilai ulang, menyusun jawaban), "usage" (token),
-// "answer_delta"/"answer_reset" (jawaban mengalir), lalu "done" (jawaban lengkap) atau "error".
-// Menutup koneksi (tombol Stop) membatalkan pencarian & panggilan LLM yang sedang berjalan.
-func (h *Handler) AgenticAIChatStream(c *gin.Context) {
-	user := getCurrentUser(c)
-	var req service.AIChatRequest
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Prompt) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Pertanyaan / Prompt tidak boleh kosong"})
-		return
-	}
-	actor, impersonating := getRealUser(c)
-
-	c.Header("Content-Type", "text/event-stream")
-	// no-transform: proxy/kompresor (mis. gzip pada rewrite Next.js) tidak boleh menampung stream; tanpa ini
-	// langkah AI & jawaban baru tiba sekaligus di akhir
-	c.Header("Cache-Control", "no-cache, no-transform")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-	c.Status(http.StatusOK)
-
-	// Semua penulisan ke response dijaga mutex; setelah handler selesai (closed) tidak ada lagi yang menulis
-	var mu sync.Mutex
-	closed := false
-	emit := func(event string, data any) {
-		payload, err := json.Marshal(data)
-		if err != nil {
-			return
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if closed {
-			return
-		}
-		fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, payload)
-		c.Writer.Flush()
-	}
-	defer func() {
-		mu.Lock()
-		closed = true
-		mu.Unlock()
-	}()
-
-	// Detak berkala agar koneksi tidak diputus proxy saat menunggu LLM
-	ctx := c.Request.Context()
-	go func() {
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				mu.Lock()
-				if closed {
-					mu.Unlock()
-					return
-				}
-				fmt.Fprint(c.Writer, ": ping\n\n")
-				c.Writer.Flush()
-				mu.Unlock()
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	resp, err := service.AnswerAgenticQuery(ctx, h.DB, user, req, actor.ID, emit)
-	if err != nil {
-		if ctx.Err() == nil {
-			log.Printf("[Agentic AI] stream gagal: %v", err)
-			message := "Gagal memproses pencarian Agentic AI"
-			var agentErr *service.AgentError
-			if errors.As(err, &agentErr) {
-				message = agentErr.Message
-			}
-			emit("error", gin.H{"error": message})
-		}
-		return
-	}
-	if ctx.Err() != nil {
-		return
-	}
-	h.recordAgenticChat(ctx, user, actor, impersonating, req, resp)
-	emit("done", resp)
 }
