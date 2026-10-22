@@ -6,7 +6,7 @@ API pengelolaan dokumen audit TI: folder tim, aplikasi dan section versi, eviden
 
 ## Stack dan kebutuhan
 
-- Go sesuai `go.mod`. Untuk auto reload, Air yang dipasang sekarang membutuhkan Go 1.25+.
+- Go 1.26+ sesuai `go.mod` (minimum SDK resmi OpenAI); gunakan rilis patch terbaru yang didukung.
 - Docker dengan Compose untuk PostgreSQL 17 dev, atau server PostgreSQL 17 yang sudah tersedia.
 - Hak perubahan skema pada database pengembangan untuk migrasi saat startup.
 - MinIO opsional. Tanpa kredensial lengkap, file baru disimpan di `uploads/`.
@@ -141,6 +141,13 @@ Semua path di bawah relatif terhadap `/api/v1`.
 | Super Admin | `/admin/settings/ai`, `/admin/settings/rerank` dan endpoint kuotanya |
 
 Metode dan route lengkap: [`cmd/api/main.go`](cmd/api/main.go). Validasi role tambahan tetap berlaku pada handler; tidak semua pengguna terautentikasi boleh mengubah master data.
+
+## Alur chat AI
+
+- Handler JSON dan SSE di `internal/handler/ai_chat.go` memakai satu use case `service.RunChat`. Service menjalankan harness, lalu menyimpan audit, sesi, dan pesan dalam satu transaksi; ID hasil hanya diberikan setelah commit. Impersonation hanya mencatat audit atas akun asli, tanpa menambah riwayat.
+- SSE meneruskan progres dan `answer_delta`/`answer_reset`, lalu satu event terminal `done` atau `error`. `done` berarti penyimpanan berhasil. Pembatalan request atau kegagalan write/flush membatalkan pekerjaan; heartbeat berhenti sebelum handler keluar.
+- Tool calling memakai SDK resmi `openai-go/v3`: parameter/definisi function bertipe, endpoint dan API key dari konfigurasi PANDA, tanpa retry otomatis SDK. Harness tetap memiliki otorisasi, validasi argumen, eksekusi tool, dan budget; SDK bukan agent runner.
+- Parser respons kompatibilitas tetap dipakai untuk menolak stream terputus serta mempertahankan `extra_content`/thought signature Gemini. Analisis upload dan tes koneksi teks biasa di `llm_client.go` belum memakai SDK ini.
 
 ## Tes dan build
 
