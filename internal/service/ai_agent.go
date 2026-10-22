@@ -74,24 +74,7 @@ type AIChatResponse struct {
 // scopedDocuments mengembalikan query dokumen yang boleh diakses user. Selalu membuat chain baru
 // karena chain GORM tidak aman dipakai ulang (dipakai juga sebagai subquery pencarian isi dokumen).
 func scopedDocuments(db *gorm.DB, user models.User, filterModule string) *gorm.DB {
-	query := db.Model(&models.Document{})
-
-	if !user.IsAdmin() {
-		// Isolasi Data sesuai PRD: Pegawai TI hanya bisa mencari data Tim/Branch-nya sendiri atau dokumen All Tim
-		if user.TeamID != nil && user.BranchID != nil {
-			query = query.Where(
-				"(visibility_scope = 'ALL_TIM') OR (owner_team_id = ? AND (owner_branch_id IS NULL OR owner_branch_id = '' OR owner_branch_id = ?))",
-				*user.TeamID, *user.BranchID,
-			)
-		} else if user.TeamID != nil {
-			query = query.Where(
-				"(visibility_scope = 'ALL_TIM') OR (owner_team_id = ?)",
-				*user.TeamID,
-			)
-		} else {
-			query = query.Where("visibility_scope = 'ALL_TIM'")
-		}
-	}
+	query := ApplyDocumentScope(db.Model(&models.Document{}), user)
 
 	if filterModule == "APPLICATION" || filterModule == "EVIDENCE" {
 		query = query.Where("module_source = ?", filterModule)

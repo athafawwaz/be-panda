@@ -18,6 +18,10 @@ func main() {
 	_ = godotenv.Load(".env")
 	_ = godotenv.Load("../.env")
 
+	if err := service.ValidateAppSecret(); err != nil {
+		log.Fatalf("Invalid JWT configuration: %v", err)
+	}
+
 	db, err := database.ConnectAndMigrate()
 	if err != nil {
 		log.Fatalf("Database connection failed: %v", err)
@@ -59,15 +63,14 @@ func main() {
 		// Public endpoints
 		api.GET("/public/stats", h.GetPublicStats)
 		api.POST("/auth/login", h.Login)
-		// Preview & Download endpoints (support direct link click & iframe preview)
-		api.GET("/documents/:id/preview", h.PreviewDocument)
-		api.GET("/documents/:id/download", h.DownloadDocument)
 
 		// Protected endpoints
 		protected := api.Group("")
 		protected.Use(h.AuthMiddleware())
 		{
 			protected.GET("/auth/me", h.GetMe)
+			protected.GET("/documents/:id/preview", h.PreviewDocument)
+			protected.GET("/documents/:id/download", h.DownloadDocument)
 			protected.GET("/dashboard/summary", h.GetDashboardSummary)
 
 			// Master Data Tim, Branch & Master Akses (Badge RBAC)

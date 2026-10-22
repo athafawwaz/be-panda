@@ -337,6 +337,9 @@ func normalizeDocumentMeta(m *documentMeta, r resolvedTarget, user models.User) 
 	if m.VersionLabel == "" {
 		m.VersionLabel = "v1.0"
 	}
+	if !validVersionLabel(m.VersionLabel) {
+		return http.StatusBadRequest, "Label versi maksimal 50 karakter dan tidak boleh mengandung pemisah path atau karakter khusus nama file"
+	}
 	if m.AuditTags = strings.TrimSpace(m.AuditTags); m.AuditTags == "" {
 		m.AuditTags = fmt.Sprintf("AUDIT-INT-%d", time.Now().Year())
 	}

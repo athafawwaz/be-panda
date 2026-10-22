@@ -47,8 +47,6 @@ func (h *Handler) AuthMiddleware() gin.HandlerFunc {
 		tokenStr := ""
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
-		} else if qToken := c.Query("token"); qToken != "" {
-			tokenStr = qToken
 		}
 
 		if tokenStr == "" {
@@ -59,7 +57,7 @@ func (h *Handler) AuthMiddleware() gin.HandlerFunc {
 
 		token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
 			return h.JWTSecret, nil
-		})
+		}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 		if err != nil || !token.Valid {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token tidak valid atau telah kedaluwarsa"})
 			c.Abort()
@@ -106,7 +104,7 @@ func (h *Handler) buildImpersonatedUser(c *gin.Context, real models.User, teamID
 	}
 
 	readOnlyAllowed := c.Request.Method == http.MethodGet ||
-		(c.Request.Method == http.MethodPost && c.FullPath() == "/api/v1/ai/chat")
+		(c.Request.Method == http.MethodPost && (c.FullPath() == "/api/v1/ai/chat" || c.FullPath() == "/api/v1/ai/chat/stream"))
 	if !readOnlyAllowed {
 		return real, http.StatusForbidden, "Mode impersonate bersifat read-only. Keluar dari impersonate untuk mengubah data."
 	}
@@ -258,19 +256,9 @@ func (h *Handler) GetMe(c *gin.Context) {
 func (h *Handler) GetDashboardSummary(c *gin.Context) {
 	user := getCurrentUser(c)
 
-	folderQuery := h.DB.Model(&models.AppFolder{}).Preload("AssignedTeam").Preload("AssignedBranch").Preload("Applications")
-	docQuery := h.DB.Model(&models.Document{}).Preload("Application").Preload("Folder").Preload("Section")
-	logQuery := h.DB.Model(&models.UploadAuditLog{})
-
-	if !user.IsAdmin() {
-		if user.TeamID != nil && user.BranchID != nil {
-			folderQuery = folderQuery.Where("assigned_team_id = ? AND (assigned_branch_id IS NULL OR assigned_branch_id = '' OR assigned_branch_id = ?)", *user.TeamID, *user.BranchID)
-			docQuery = docQuery.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ? AND (owner_branch_id IS NULL OR owner_branch_id = '' OR owner_branch_id = ?))", *user.TeamID, *user.BranchID)
-		} else if user.TeamID != nil {
-			folderQuery = folderQuery.Where("assigned_team_id = ?", *user.TeamID)
-			docQuery = docQuery.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ?)", *user.TeamID)
-		}
-	}
+	folderQuery := applyFolderScope(h.DB.Model(&models.AppFolder{}), user).Preload("AssignedTeam").Preload("AssignedBranch").Preload("Applications")
+	docQuery := service.ApplyDocumentScope(h.DB.Model(&models.Document{}), user).Preload("Application").Preload("Folder").Preload("Section")
+	logQuery := h.scopedUploadLogs(c)
 
 	var folders []models.AppFolder
 	folderQuery.Order("created_at DESC").Find(&folders)
@@ -456,6 +444,15 @@ func (h *Handler) CreateApplication(c *gin.Context) {
 		return
 	}
 
+	initVer := strings.TrimSpace(req.InitialVersion)
+	if initVer == "" {
+		initVer = "v1.0"
+	}
+	if !validVersionLabel(initVer) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Label versi maksimal 50 karakter dan tidak boleh mengandung pemisah path atau karakter khusus nama file"})
+		return
+	}
+
 	status := req.Status
 	if status == "" {
 		status = "PRODUCTION"
@@ -477,10 +474,6 @@ func (h *Handler) CreateApplication(c *gin.Context) {
 		return
 	}
 
-	initVer := strings.TrimSpace(req.InitialVersion)
-	if initVer == "" {
-		initVer = "v1.0"
-	}
 	initTitle := strings.TrimSpace(req.InitialTitle)
 	if initTitle == "" {
 		initTitle = "Pembuatan Awal Aplikasi (Initial Release)"
@@ -520,6 +513,7 @@ func (h *Handler) CreateApplication(c *gin.Context) {
 }
 
 func (h *Handler) GetApplicationDetail(c *gin.Context) {
+	user := getCurrentUser(c)
 	appID := c.Param("id")
 	var app models.Application
 	err := h.DB.
@@ -534,7 +528,7 @@ func (h *Handler) GetApplicationDetail(c *gin.Context) {
 		}).
 		First(&app, "id = ?", appID).Error
 
-	if err != nil {
+	if err != nil || app.Folder == nil || !canAccessFolder(user, *app.Folder) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Aplikasi tidak ditemukan"})
 		return
 	}
@@ -553,7 +547,7 @@ func (h *Handler) CreateAppSection(c *gin.Context) {
 	appID := c.Param("id")
 
 	var app models.Application
-	if err := h.DB.Preload("Folder").First(&app, "id = ?", appID).Error; err != nil {
+	if err := h.DB.Preload("Folder").First(&app, "id = ?", appID).Error; err != nil || app.Folder == nil || !canAccessFolder(user, *app.Folder) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Aplikasi tidak ditemukan"})
 		return
 	}
@@ -561,6 +555,11 @@ func (h *Handler) CreateAppSection(c *gin.Context) {
 	var req createSectionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Label Versi dan Nama Section Perubahan wajib diisi"})
+		return
+	}
+	req.VersionLabel = strings.TrimSpace(req.VersionLabel)
+	if !validVersionLabel(req.VersionLabel) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Label versi maksimal 50 karakter dan tidak boleh mengandung pemisah path atau karakter khusus nama file"})
 		return
 	}
 
@@ -628,15 +627,7 @@ func (h *Handler) GetEvidenceList(c *gin.Context) {
 		query = query.Where("module_source = ?", moduleFilter)
 	}
 
-	if !user.IsAdmin() {
-		if user.TeamID != nil && user.BranchID != nil {
-			query = query.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ? AND (owner_branch_id IS NULL OR owner_branch_id = '' OR owner_branch_id = ?))", *user.TeamID, *user.BranchID)
-		} else if user.TeamID != nil {
-			query = query.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ?)", *user.TeamID)
-		} else {
-			query = query.Where("visibility_scope = 'ALL_TIM'")
-		}
-	}
+	query = service.ApplyDocumentScope(query, user)
 
 	var docs []models.Document
 	query.Order("uploaded_at DESC").Find(&docs)
@@ -706,7 +697,7 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 // bukan diganti PDF buatan, agar auditor tidak pernah melihat dokumen yang bukan file asli.
 func (h *Handler) serveDocumentFile(c *gin.Context, disposition string) {
 	var doc models.Document
-	if err := h.DB.First(&doc, "id = ?", c.Param("id")).Error; err != nil {
+	if err := service.ApplyDocumentScope(h.DB.Model(&models.Document{}), getCurrentUser(c)).Where("id = ?", c.Param("id")).First(&doc).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Dokumen tidak ditemukan"})
 		return
 	}
@@ -724,6 +715,8 @@ func (h *Handler) serveDocumentFile(c *gin.Context, disposition string) {
 	}
 	defer file.Close()
 
+	c.Header("Cache-Control", "private, no-store")
+	c.Header("X-Content-Type-Options", "nosniff")
 	c.Header("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, doc.StandardizedName))
 	if disposition == "inline" && strings.HasSuffix(strings.ToLower(doc.StandardizedName), ".pdf") {
 		c.Header("Content-Type", "application/pdf")
@@ -742,21 +735,22 @@ func (h *Handler) DownloadDocument(c *gin.Context) {
 
 // ─── Detail Log Aktivitas & Upload ───────────────────────────────────────────
 
-func (h *Handler) GetUploadLogs(c *gin.Context) {
+// scopedUploadLogs memakai ID dokumen, bukan label tim yang bisa berubah atau cocok sebagian.
+func (h *Handler) scopedUploadLogs(c *gin.Context) *gorm.DB {
 	user := getCurrentUser(c)
 	query := h.DB.Model(&models.UploadAuditLog{})
-
-	if !user.IsAdmin() {
-		teamLabel := formatUserTeamLabel(user)
-		if _, impersonating := getRealUser(c); impersonating {
-			// Segmen impersonate tidak punya log "milik sendiri"; jangan ikutkan log pribadi Super Admin
-			query = query.Where("team_and_branch_label LIKE ? OR visibility_label LIKE ?",
-				"%"+teamLabel+"%", "%Semua Tim%")
-		} else {
-			query = query.Where("badge_number = ? OR team_and_branch_label LIKE ? OR visibility_label LIKE ?",
-				user.BadgeNumber, "%"+teamLabel+"%", "%Semua Tim%")
-		}
+	if user.IsAdmin() {
+		return query
 	}
+	docs := service.ApplyDocumentScope(h.DB.Model(&models.Document{}), user).Select("id")
+	if _, impersonating := getRealUser(c); impersonating {
+		return query.Where("action_type <> ? AND document_id IN (?)", "AI_SEARCH", docs)
+	}
+	return query.Where("badge_number = ? OR (action_type <> ? AND document_id IN (?))", user.BadgeNumber, "AI_SEARCH", docs)
+}
+
+func (h *Handler) GetUploadLogs(c *gin.Context) {
+	query := h.scopedUploadLogs(c)
 
 	var logs []models.UploadAuditLog
 	query.Order("action_timestamp DESC").Limit(100).Find(&logs)
