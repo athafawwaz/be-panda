@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -27,43 +28,52 @@ const (
 
 // ChatTurn adalah satu tanya-jawab sebelumnya dalam percakapan yang sama.
 type ChatTurn struct {
-	Prompt      string
-	Reply       string   // jawaban AI (markdown) sebagaimana ditampilkan ke user
-	EngineMode  string   // engine yang menyusun jawaban, menentukan apakah jawaban memuat kutipan isi dokumen
-	DocumentIDs []string // dokumen yang dikutip pada jawaban
-	DocTitles   []string // "Judul (versi)", hanya metadata — tanpa isi dokumen
-	Focus       bool     // pesan yang sedang dibalas / diteruskan user: selalu menjadi konteks pertanyaan
+	Prompt         string
+	Reply          string   // jawaban AI (markdown) sebagaimana ditampilkan ke user
+	EngineMode     string   // label tampilan engine; bukan kontrol berbagi isi dokumen
+	DocumentIDs    []string // dokumen yang dikutip pada jawaban
+	DocTitles      []string // "Judul (versi)", hanya metadata — tanpa isi dokumen
+	Focus          bool     // pesan yang sedang dibalas / diteruskan user: selalu menjadi konteks pertanyaan
+	DocContentUsed *bool
 }
 
 // LoadRecentTurns membaca n tanya-jawab terakhir (urut lama → baru) dari sesi chat milik userID.
 // Sesi milik user lain atau sesi kosong menghasilkan nil, sehingga riwayat tidak bisa disuntikkan dari request.
-func LoadRecentTurns(db *gorm.DB, sessionID, userID string, n int) []ChatTurn {
+func LoadRecentTurns(db *gorm.DB, sessionID, userID string, n int) ([]ChatTurn, error) {
 	if sessionID == "" || userID == "" || n <= 0 {
-		return nil
+		return nil, nil
 	}
 	var owned int64
-	db.Model(&models.AIChatSession{}).Where("id = ? AND user_id = ?", sessionID, userID).Count(&owned)
+	if err := db.Model(&models.AIChatSession{}).Where("id = ? AND user_id = ?", sessionID, userID).Count(&owned).Error; err != nil {
+		return nil, fmt.Errorf("load chat session owner: %w", err)
+	}
 	if owned == 0 {
-		return nil
+		return nil, nil
 	}
 	var msgs []models.AIChatMessage
-	db.Select("id", "prompt", "reply_markdown", "engine_mode", "matched_documents_json").
+	if err := db.Select("id", "prompt", "reply_markdown", "engine_mode", "matched_documents_json", "trace_json").
 		Where("session_id = ?", sessionID).
 		Order("id DESC").Limit(n).
-		Find(&msgs)
+		Find(&msgs).Error; err != nil {
+		return nil, fmt.Errorf("load chat history: %w", err)
+	}
 
 	turns := make([]ChatTurn, 0, len(msgs))
 	for i := len(msgs) - 1; i >= 0; i-- {
 		var docs []AIDocumentCitation
 		_ = json.Unmarshal([]byte(msgs[i].MatchedDocumentsJSON), &docs)
 		t := ChatTurn{Prompt: msgs[i].Prompt, Reply: msgs[i].ReplyMarkdown, EngineMode: msgs[i].EngineMode}
+		var trace AgentTrace
+		if json.Unmarshal([]byte(msgs[i].TraceJSON), &trace) == nil {
+			t.DocContentUsed = trace.DocContentUsed
+		}
 		for _, d := range docs {
 			t.DocumentIDs = append(t.DocumentIDs, d.ID)
 			t.DocTitles = append(t.DocTitles, fmt.Sprintf("%s (%s)", d.Title, d.VersionLabel))
 		}
 		turns = append(turns, t)
 	}
-	return turns
+	return turns, nil
 }
 
 // followUpMarkers: kata rujukan yang menandakan pertanyaan bergantung pada jawaban sebelumnya.
@@ -155,7 +165,11 @@ func rewriteFollowUpQuestion(db *gorm.DB, cfg LLMConfig, history []ChatTurn, pro
 			sb.WriteString("   Dokumen yang ditemukan: " + strings.Join(t.DocTitles, "; ") + "\n")
 		}
 	}
-	reply, usage, err := chatCompletionCtx(context.Background(), cfg, []map[string]string{
+	ctx := context.Background()
+	if db != nil {
+		ctx = db.Statement.Context
+	}
+	reply, usage, err := chatCompletionCtx(ctx, cfg, []map[string]string{
 		{"role": "system", "content": "Tugas Anda menulis ulang pertanyaan lanjutan menjadi satu pertanyaan mandiri dalam Bahasa Indonesia. " +
 			"Pakai riwayat percakapan untuk melengkapi rujukan seperti 'tersebut', 'tadi', 'yang kedua', atau 'versi sebelumnya' " +
 			"dengan nama aplikasi, jenis dokumen, atau versi yang dimaksud. Jangan menjawab pertanyaan dan jangan menambah topik baru. " +
@@ -174,9 +188,9 @@ func rewriteFollowUpQuestion(db *gorm.DB, cfg LLMConfig, history []ChatTurn, pro
 // riwayat chat milik ownerID (bukan dipercaya dari klien). Hasilnya: giliran "fokus" untuk pencarian (dokumen yang
 // dikutip pesan itu diutamakan) dan catatan untuk LLM. Jawaban lama yang memuat kutipan isi dokumen tidak dikirim ke
 // LLM eksternal bila saklar isi dokumen mati — hanya judul dokumennya.
-func resolveReplyRef(db *gorm.DB, ownerID string, ref *ChatReplyRef, shareContent bool) (*ChatTurn, string) {
+func resolveReplyRef(db *gorm.DB, ownerID string, ref *ChatReplyRef, shareContent bool) (*ChatTurn, string, error) {
 	if ref == nil || (ref.MessageID == 0 && strings.TrimSpace(ref.Text) == "") {
-		return nil, ""
+		return nil, "", nil
 	}
 	answer := ref.Role == "answer"
 	turn := ChatTurn{Focus: true}
@@ -188,9 +202,16 @@ func resolveReplyRef(db *gorm.DB, ownerID string, ref *ChatReplyRef, shareConten
 			Joins("JOIN ai_chat_sessions s ON s.id = m.session_id").
 			Where("m.id = ? AND s.user_id = ?", ref.MessageID, ownerID).
 			Take(&m).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, "", fmt.Errorf("load reply reference: %w", err)
+		}
 		if err == nil {
 			known = true
 			turn.Prompt = m.Prompt
+			var trace AgentTrace
+			if json.Unmarshal([]byte(m.TraceJSON), &trace) == nil {
+				turn.DocContentUsed = trace.DocContentUsed
+			}
 			if answer {
 				text, engine = m.ReplyMarkdown, m.EngineMode
 				var docs []AIDocumentCitation
@@ -213,7 +234,7 @@ func resolveReplyRef(db *gorm.DB, ownerID string, ref *ChatReplyRef, shareConten
 	turn.Reply, turn.EngineMode = text, engine
 
 	shown := clip(text, maxHistoryReplyRunes)
-	if answer && !shareContent && !replyFreeOfDocContent(engine) {
+	if answer && !shareContent && !replyFreeOfDocContent(turn.DocContentUsed) {
 		shown = "(isi jawaban tidak disertakan karena memuat kutipan isi dokumen, sesuai kebijakan data perusahaan"
 		if len(turn.DocTitles) > 0 {
 			shown += "; dokumen yang dibahas: " + strings.Join(turn.DocTitles, "; ")
@@ -232,7 +253,7 @@ func resolveReplyRef(db *gorm.DB, ownerID string, ref *ChatReplyRef, shareConten
 		verb = "meneruskan dari percakapan lain"
 	}
 	note := fmt.Sprintf("Catatan sistem: user %s %s berikut, dan pertanyaan terbarunya merujuk pesan ini:\n«%s»\n\n", verb, what, shown)
-	return &turn, note
+	return &turn, note, nil
 }
 
 // cleanRewrittenQuestion mengambil baris pertama jawaban LLM tanpa label & tanda kutip.
@@ -292,13 +313,9 @@ func isConversationQuestion(prompt string) bool {
 	return has(conversationMarkers) || (has(selfAskMarkers) && has(timeMarkers))
 }
 
-// replyFreeOfDocContent: jawaban lama yang aman dikirim ke LLM eksternal walau isi dokumen tidak boleh dikirim,
-// yaitu jawaban yang memang disusun tanpa isi file.
-func replyFreeOfDocContent(engineMode string) bool {
-	return strings.Contains(engineMode, "isi dokumen tidak dikirim") ||
-		strings.Contains(engineMode, generalEngineMarker) ||
-		strings.HasPrefix(engineMode, "PANDA Document Guard") ||
-		strings.HasPrefix(engineMode, conversationEngineMode)
+// replyFreeOfDocContent memakai provenance tersimpan; riwayat tanpa status tetap ditahan.
+func replyFreeOfDocContent(used *bool) bool {
+	return used != nil && !*used
 }
 
 // historyMessages menyusun riwayat percakapan sebagai pesan user/assistant untuk LLM eksternal (urut lama → baru).
@@ -311,7 +328,7 @@ func historyMessages(history []ChatTurn, shareContent bool) []map[string]string 
 		if reply == "" {
 			reply = "(tidak ada jawaban tersimpan)"
 		}
-		if !shareContent && !replyFreeOfDocContent(t.EngineMode) {
+		if !shareContent && !replyFreeOfDocContent(t.DocContentUsed) {
 			reply = "(Jawaban ini memuat kutipan isi dokumen sehingga tidak disertakan sesuai kebijakan data perusahaan."
 			if len(t.DocTitles) > 0 {
 				reply += " Dokumen yang dibahas: " + strings.Join(t.DocTitles, "; ") + "."

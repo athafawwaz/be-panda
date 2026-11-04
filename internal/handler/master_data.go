@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
@@ -32,13 +32,12 @@ func initialAdminBadge() string {
 	return "2411249"
 }
 
-func requireAdmin(c *gin.Context, msg string) (models.User, bool) {
+func requireAdmin(c fiber.Ctx, msg string) (models.User, error) {
 	u := getCurrentUser(c)
 	if !u.IsAdmin() {
-		c.JSON(http.StatusForbidden, gin.H{"error": msg})
-		return u, false
+		return u, fiber.NewError(http.StatusForbidden, msg)
 	}
-	return u, true
+	return u, nil
 }
 
 func (h *Handler) logMasterAction(actor models.User, actionType, detail string) {
@@ -115,27 +114,27 @@ func usageMessage(subject string, users, folders, docs int64) string {
 
 // ─── Tim ─────────────────────────────────────────────────────────────────────
 
-func (h *Handler) GetMasterTeams(c *gin.Context) {
+func (h *Handler) GetMasterTeams(c fiber.Ctx) error {
 	var teams []models.MasterTeam
 	h.DB.Preload("Branches", func(db *gorm.DB) *gorm.DB {
 		return db.Order("branch_name ASC")
 	}).Order("team_name ASC").Find(&teams)
-	c.JSON(http.StatusOK, gin.H{"teams": teams})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"teams": teams})
 }
 
 type teamRequest struct {
 	TeamName string `json:"team_name" binding:"required"`
 }
 
-func (h *Handler) CreateMasterTeam(c *gin.Context) {
-	actor, ok := requireAdmin(c, "Hanya Admin yang dapat menambah Tim")
-	if !ok {
-		return
+func (h *Handler) CreateMasterTeam(c fiber.Ctx) error {
+	actor, err := requireAdmin(c, "Hanya Admin yang dapat menambah Tim")
+	if err != nil {
+		return err
 	}
 	var req teamRequest
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.TeamName) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Nama Tim wajib diisi"})
-		return
+	if err := c.Bind().JSON(&req); err != nil || strings.TrimSpace(req.TeamName) == "" {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Nama Tim wajib diisi"})
+
 	}
 	name := strings.TrimSpace(req.TeamName)
 	code := makeCode(name)
@@ -143,81 +142,81 @@ func (h *Handler) CreateMasterTeam(c *gin.Context) {
 	var dup int64
 	h.DB.Model(&models.MasterTeam{}).Where("team_code = ? OR LOWER(team_name) = LOWER(?)", code, name).Count(&dup)
 	if dup > 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Tim '%s' sudah terdaftar", name)})
-		return
+		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": fmt.Sprintf("Tim '%s' sudah terdaftar", name)})
+
 	}
 
 	team := models.MasterTeam{ID: uuid.NewString(), TeamCode: code, TeamName: name}
 	if err := h.DB.Create(&team).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menambah Tim"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menambah Tim"})
+
 	}
 	h.logMasterAction(actor, "ADD_TEAM", fmt.Sprintf("%s (%s) menambahkan Tim '%s'", actor.FullName, actor.BadgeNumber, team.TeamName))
-	c.JSON(http.StatusCreated, gin.H{"team": team})
+	return c.Status(http.StatusCreated).JSON(fiber.Map{"team": team})
 }
 
-func (h *Handler) UpdateMasterTeam(c *gin.Context) {
-	actor, ok := requireAdmin(c, "Hanya Admin yang dapat mengubah Tim")
-	if !ok {
-		return
+func (h *Handler) UpdateMasterTeam(c fiber.Ctx) error {
+	actor, err := requireAdmin(c, "Hanya Admin yang dapat mengubah Tim")
+	if err != nil {
+		return err
 	}
 	var team models.MasterTeam
-	if err := h.DB.First(&team, "id = ?", c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Tim tidak ditemukan"})
-		return
+	if err := h.DB.First(&team, "id = ?", c.Params("id")).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Tim tidak ditemukan"})
+
 	}
 	var req teamRequest
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.TeamName) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Nama Tim wajib diisi"})
-		return
+	if err := c.Bind().JSON(&req); err != nil || strings.TrimSpace(req.TeamName) == "" {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Nama Tim wajib diisi"})
+
 	}
 	name := strings.TrimSpace(req.TeamName)
 
 	var dup int64
 	h.DB.Model(&models.MasterTeam{}).Where("id <> ? AND LOWER(team_name) = LOWER(?)", team.ID, name).Count(&dup)
 	if dup > 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Tim '%s' sudah terdaftar", name)})
-		return
+		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": fmt.Sprintf("Tim '%s' sudah terdaftar", name)})
+
 	}
 
 	oldName := team.TeamName
 	if err := h.DB.Model(&team).Update("team_name", name).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengubah Tim"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal mengubah Tim"})
+
 	}
 	h.logMasterAction(actor, "UPDATE_TEAM", fmt.Sprintf("%s (%s) mengubah nama Tim '%s' menjadi '%s'", actor.FullName, actor.BadgeNumber, oldName, name))
-	c.JSON(http.StatusOK, gin.H{"team": team})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"team": team})
 }
 
-func (h *Handler) DeleteMasterTeam(c *gin.Context) {
-	actor, ok := requireAdmin(c, "Hanya Admin yang dapat menghapus Tim")
-	if !ok {
-		return
+func (h *Handler) DeleteMasterTeam(c fiber.Ctx) error {
+	actor, err := requireAdmin(c, "Hanya Admin yang dapat menghapus Tim")
+	if err != nil {
+		return err
 	}
 	var team models.MasterTeam
-	if err := h.DB.First(&team, "id = ?", c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Tim tidak ditemukan"})
-		return
+	if err := h.DB.First(&team, "id = ?", c.Params("id")).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Tim tidak ditemukan"})
+
 	}
 	// Pengguna/folder/dokumen ber-branch selalu juga menyimpan team_id, jadi cek level tim sudah mencakup branch-nya.
 	users, folders, docs := h.countUsage("team_id", "assigned_team_id", "owner_team_id", team.ID)
 	if users+folders+docs > 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": usageMessage(fmt.Sprintf("Tim '%s'", team.TeamName), users, folders, docs)})
-		return
+		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": usageMessage(fmt.Sprintf("Tim '%s'", team.TeamName), users, folders, docs)})
+
 	}
 
-	err := h.DB.Transaction(func(tx *gorm.DB) error {
+	err = h.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("team_id = ?", team.ID).Delete(&models.MasterBranch{}).Error; err != nil {
 			return err
 		}
 		return tx.Delete(&team).Error
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus Tim"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menghapus Tim"})
+
 	}
 	h.logMasterAction(actor, "DELETE_TEAM", fmt.Sprintf("%s (%s) menghapus Tim '%s' beserta branch-nya", actor.FullName, actor.BadgeNumber, team.TeamName))
-	c.JSON(http.StatusOK, gin.H{"message": "Tim berhasil dihapus"})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"message": "Tim berhasil dihapus"})
 }
 
 // ─── Branch ──────────────────────────────────────────────────────────────────
@@ -239,25 +238,25 @@ func (h *Handler) branchNameTaken(teamID, name, excludeID string) bool {
 	return dup > 0
 }
 
-func (h *Handler) CreateMasterBranch(c *gin.Context) {
-	actor, ok := requireAdmin(c, "Hanya Admin yang dapat menambah Branch Tim")
-	if !ok {
-		return
+func (h *Handler) CreateMasterBranch(c fiber.Ctx) error {
+	actor, err := requireAdmin(c, "Hanya Admin yang dapat menambah Branch Tim")
+	if err != nil {
+		return err
 	}
 	var req createBranchReq
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.BranchName) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Data branch tidak lengkap"})
-		return
+	if err := c.Bind().JSON(&req); err != nil || strings.TrimSpace(req.BranchName) == "" {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Data branch tidak lengkap"})
+
 	}
 	var team models.MasterTeam
 	if err := h.DB.First(&team, "id = ?", req.TeamID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Tim tidak ditemukan"})
-		return
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Tim tidak ditemukan"})
+
 	}
 	name := strings.TrimSpace(req.BranchName)
 	if h.branchNameTaken(team.ID, name, "") {
-		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Branch '%s' sudah ada di %s", name, team.TeamName)})
-		return
+		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": fmt.Sprintf("Branch '%s' sudah ada di %s", name, team.TeamName)})
+
 	}
 
 	branch := models.MasterBranch{
@@ -267,63 +266,63 @@ func (h *Handler) CreateMasterBranch(c *gin.Context) {
 		BranchName: name,
 	}
 	if err := h.DB.Create(&branch).Error; err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Gagal menambah branch"})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Gagal menambah branch"})
+
 	}
 	h.DB.Model(&models.MasterTeam{}).Where("id = ?", team.ID).Update("has_branches", true)
 	h.logMasterAction(actor, "ADD_BRANCH", fmt.Sprintf("%s (%s) menambahkan Branch '%s' ke %s", actor.FullName, actor.BadgeNumber, name, team.TeamName))
-	c.JSON(http.StatusCreated, gin.H{"branch": branch})
+	return c.Status(http.StatusCreated).JSON(fiber.Map{"branch": branch})
 }
 
-func (h *Handler) UpdateMasterBranch(c *gin.Context) {
-	actor, ok := requireAdmin(c, "Hanya Admin yang dapat mengubah Branch")
-	if !ok {
-		return
+func (h *Handler) UpdateMasterBranch(c fiber.Ctx) error {
+	actor, err := requireAdmin(c, "Hanya Admin yang dapat mengubah Branch")
+	if err != nil {
+		return err
 	}
 	var branch models.MasterBranch
-	if err := h.DB.First(&branch, "id = ?", c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Branch tidak ditemukan"})
-		return
+	if err := h.DB.First(&branch, "id = ?", c.Params("id")).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Branch tidak ditemukan"})
+
 	}
 	var req updateBranchReq
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.BranchName) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Nama Branch wajib diisi"})
-		return
+	if err := c.Bind().JSON(&req); err != nil || strings.TrimSpace(req.BranchName) == "" {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Nama Branch wajib diisi"})
+
 	}
 	name := strings.TrimSpace(req.BranchName)
 	if h.branchNameTaken(branch.TeamID, name, branch.ID) {
-		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Branch '%s' sudah ada di tim ini", name)})
-		return
+		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": fmt.Sprintf("Branch '%s' sudah ada di tim ini", name)})
+
 	}
 
 	oldName := branch.BranchName
 	if err := h.DB.Model(&branch).Update("branch_name", name).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengubah Branch"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal mengubah Branch"})
+
 	}
 	h.logMasterAction(actor, "UPDATE_BRANCH", fmt.Sprintf("%s (%s) mengubah nama Branch '%s' menjadi '%s'", actor.FullName, actor.BadgeNumber, oldName, name))
-	c.JSON(http.StatusOK, gin.H{"branch": branch})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"branch": branch})
 }
 
-func (h *Handler) DeleteMasterBranch(c *gin.Context) {
-	actor, ok := requireAdmin(c, "Hanya Admin yang dapat menghapus Branch")
-	if !ok {
-		return
+func (h *Handler) DeleteMasterBranch(c fiber.Ctx) error {
+	actor, err := requireAdmin(c, "Hanya Admin yang dapat menghapus Branch")
+	if err != nil {
+		return err
 	}
 	var branch models.MasterBranch
-	if err := h.DB.First(&branch, "id = ?", c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Branch tidak ditemukan"})
-		return
+	if err := h.DB.First(&branch, "id = ?", c.Params("id")).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Branch tidak ditemukan"})
+
 	}
 	users, folders, docs := h.countUsage("branch_id", "assigned_branch_id", "owner_branch_id", branch.ID)
 	if users+folders+docs > 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": usageMessage(fmt.Sprintf("Branch '%s'", branch.BranchName), users, folders, docs)})
-		return
+		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": usageMessage(fmt.Sprintf("Branch '%s'", branch.BranchName), users, folders, docs)})
+
 	}
 
 	if err := h.DB.Delete(&branch).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus Branch"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menghapus Branch"})
+
 	}
 	var remaining int64
 	h.DB.Model(&models.MasterBranch{}).Where("team_id = ?", branch.TeamID).Count(&remaining)
@@ -331,18 +330,18 @@ func (h *Handler) DeleteMasterBranch(c *gin.Context) {
 		h.DB.Model(&models.MasterTeam{}).Where("id = ?", branch.TeamID).Update("has_branches", false)
 	}
 	h.logMasterAction(actor, "DELETE_BRANCH", fmt.Sprintf("%s (%s) menghapus Branch '%s'", actor.FullName, actor.BadgeNumber, branch.BranchName))
-	c.JSON(http.StatusOK, gin.H{"message": "Branch berhasil dihapus"})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"message": "Branch berhasil dihapus"})
 }
 
 // ─── Master Akses (Users) ────────────────────────────────────────────────────
 
-func (h *Handler) GetMasterUsers(c *gin.Context) {
-	if _, ok := requireAdmin(c, "Hanya Admin yang dapat melihat Master Akses"); !ok {
-		return
+func (h *Handler) GetMasterUsers(c fiber.Ctx) error {
+	if _, err := requireAdmin(c, "Hanya Admin yang dapat melihat Master Akses"); err != nil {
+		return err
 	}
 	var users []models.User
 	h.DB.Preload("Team").Preload("Branch").Order("created_at ASC").Find(&users)
-	c.JSON(http.StatusOK, gin.H{"users": users})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"users": users})
 }
 
 type createUserRequest struct {
@@ -374,33 +373,33 @@ func validateRoleAssignment(actor models.User, role string) (int, string) {
 	return 0, ""
 }
 
-func (h *Handler) CreateMasterUser(c *gin.Context) {
-	admin, ok := requireAdmin(c, "Hanya Admin yang dapat mengelola Master Akses")
-	if !ok {
-		return
+func (h *Handler) CreateMasterUser(c fiber.Ctx) error {
+	admin, err := requireAdmin(c, "Hanya Admin yang dapat mengelola Master Akses")
+	if err != nil {
+		return err
 	}
 
 	var req createUserRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Badge, Nama, Email, dan Role wajib diisi"})
-		return
+	if err := c.Bind().JSON(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Badge, Nama, Email, dan Role wajib diisi"})
+
 	}
 	if status, msg := validateRoleAssignment(admin, req.Role); status != 0 {
-		c.JSON(status, gin.H{"error": msg})
-		return
+		return c.Status(status).JSON(fiber.Map{"error": msg})
+
 	}
 
 	badge := strings.TrimSpace(req.BadgeNumber)
 	var existing models.User
 	if err := h.DB.Where("badge_number = ?", badge).First(&existing).Error; err == nil {
-		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Badge %s sudah terdaftar", badge)})
-		return
+		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": fmt.Sprintf("Badge %s sudah terdaftar", badge)})
+
 	}
 
 	teamID, branchID, segErr := h.resolveSegment(req.Role, req.TeamID, req.BranchID)
 	if segErr != "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": segErr})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": segErr})
+
 	}
 
 	newUser := models.User{
@@ -416,58 +415,58 @@ func (h *Handler) CreateMasterUser(c *gin.Context) {
 	}
 
 	if err := h.DB.Create(&newUser).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan akses pengguna"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menyimpan akses pengguna"})
+
 	}
 
 	h.DB.Preload("Team").Preload("Branch").First(&newUser, "id = ?", newUser.ID)
 	h.logMasterAction(admin, "ADD_USER_ACCESS", fmt.Sprintf("Admin %s (%s) mendaftarkan akses Badge %s (%s) sebagai %s - %s",
 		admin.FullName, admin.BadgeNumber, newUser.BadgeNumber, newUser.FullName, newUser.Role, formatUserTeamLabel(newUser)))
 
-	c.JSON(http.StatusCreated, gin.H{"user": newUser})
+	return c.Status(http.StatusCreated).JSON(fiber.Map{"user": newUser})
 }
 
-func (h *Handler) UpdateMasterUser(c *gin.Context) {
-	admin, ok := requireAdmin(c, "Hanya Admin yang dapat mengelola Master Akses")
-	if !ok {
-		return
+func (h *Handler) UpdateMasterUser(c fiber.Ctx) error {
+	admin, err := requireAdmin(c, "Hanya Admin yang dapat mengelola Master Akses")
+	if err != nil {
+		return err
 	}
 	var target models.User
-	if err := h.DB.Preload("Team").Preload("Branch").First(&target, "id = ?", c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User tidak ditemukan"})
-		return
+	if err := h.DB.Preload("Team").Preload("Branch").First(&target, "id = ?", c.Params("id")).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "User tidak ditemukan"})
+
 	}
 
 	var req updateUserRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Nama, Email, dan Role wajib diisi"})
-		return
+	if err := c.Bind().JSON(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Nama, Email, dan Role wajib diisi"})
+
 	}
 	if target.Role == models.RoleSuperAdmin && admin.Role != models.RoleSuperAdmin {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Akun Super Admin hanya dapat diubah oleh Super Admin"})
-		return
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "Akun Super Admin hanya dapat diubah oleh Super Admin"})
+
 	}
 	if status, msg := validateRoleAssignment(admin, req.Role); status != 0 {
-		c.JSON(status, gin.H{"error": msg})
-		return
+		return c.Status(status).JSON(fiber.Map{"error": msg})
+
 	}
 	if target.BadgeNumber == initialAdminBadge() && req.Role != models.RoleSuperAdmin {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Badge awal %s harus tetap Super Admin", target.BadgeNumber)})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": fmt.Sprintf("Badge awal %s harus tetap Super Admin", target.BadgeNumber)})
+
 	}
 	if target.ID == admin.ID && req.Role == models.RolePegawaiTI {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Anda tidak dapat menurunkan role akun Anda sendiri"})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Anda tidak dapat menurunkan role akun Anda sendiri"})
+
 	}
 	if req.IsActive != nil && !*req.IsActive && (target.ID == admin.ID || target.BadgeNumber == initialAdminBadge()) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Akun ini tidak dapat dinonaktifkan"})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Akun ini tidak dapat dinonaktifkan"})
+
 	}
 
 	teamID, branchID, segErr := h.resolveSegment(req.Role, req.TeamID, req.BranchID)
 	if segErr != "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": segErr})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": segErr})
+
 	}
 
 	before := fmt.Sprintf("%s - %s", target.Role, formatUserTeamLabel(target))
@@ -482,8 +481,8 @@ func (h *Handler) UpdateMasterUser(c *gin.Context) {
 		updates["is_active"] = *req.IsActive
 	}
 	if err := h.DB.Model(&models.User{}).Where("id = ?", target.ID).Updates(updates).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan perubahan akses"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menyimpan perubahan akses"})
+
 	}
 
 	var updated models.User
@@ -492,34 +491,34 @@ func (h *Handler) UpdateMasterUser(c *gin.Context) {
 	h.logMasterAction(admin, "UPDATE_USER_ACCESS", fmt.Sprintf("%s (%s) mengubah akses Badge %s (%s): %s → %s",
 		admin.FullName, admin.BadgeNumber, updated.BadgeNumber, updated.FullName, before, after))
 
-	c.JSON(http.StatusOK, gin.H{"user": updated})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"user": updated})
 }
 
-func (h *Handler) DeleteMasterUser(c *gin.Context) {
-	admin, ok := requireAdmin(c, "Hanya Admin yang dapat menghapus akses")
-	if !ok {
-		return
+func (h *Handler) DeleteMasterUser(c fiber.Ctx) error {
+	admin, err := requireAdmin(c, "Hanya Admin yang dapat menghapus akses")
+	if err != nil {
+		return err
 	}
 	var target models.User
-	if err := h.DB.First(&target, "id = ?", c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User tidak ditemukan"})
-		return
+	if err := h.DB.First(&target, "id = ?", c.Params("id")).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "User tidak ditemukan"})
+
 	}
 	switch {
 	case target.BadgeNumber == initialAdminBadge():
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Super Admin utama (Badge %s) tidak dapat dihapus", target.BadgeNumber)})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": fmt.Sprintf("Super Admin utama (Badge %s) tidak dapat dihapus", target.BadgeNumber)})
+
 	case target.ID == admin.ID:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Anda tidak dapat menghapus akun Anda sendiri"})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Anda tidak dapat menghapus akun Anda sendiri"})
+
 	case target.Role == models.RoleSuperAdmin && admin.Role != models.RoleSuperAdmin:
-		c.JSON(http.StatusForbidden, gin.H{"error": "Akun Super Admin hanya dapat dihapus oleh Super Admin"})
-		return
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "Akun Super Admin hanya dapat dihapus oleh Super Admin"})
+
 	}
 	if err := h.DB.Delete(&target).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus akses pengguna"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menghapus akses pengguna"})
+
 	}
 	h.logMasterAction(admin, "DELETE_USER_ACCESS", fmt.Sprintf("%s (%s) menghapus akses Badge %s (%s)", admin.FullName, admin.BadgeNumber, target.BadgeNumber, target.FullName))
-	c.JSON(http.StatusOK, gin.H{"message": "Akses pengguna berhasil dihapus"})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"message": "Akses pengguna berhasil dihapus"})
 }

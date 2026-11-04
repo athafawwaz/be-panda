@@ -5,7 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
+
 	"fmt"
 	"io"
 	"net/http"
@@ -17,7 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
@@ -113,21 +113,19 @@ type uploadedFile struct {
 
 // parseUploadForm membatasi ukuran request lalu mem-parse multipart form. Harus dipanggil
 // sebelum c.PostForm/c.FormFile agar batas ukuran berlaku.
-func parseUploadForm(c *gin.Context) (int, string) {
+func parseUploadForm(c fiber.Ctx) (int, string) {
 	limit := maxUploadBytes()
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit+(1<<20)) // +1 MB untuk field form
-	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			return http.StatusRequestEntityTooLarge, fmt.Sprintf("Ukuran file melebihi batas %d MB", limit>>20)
-		}
+	if int64(len(c.Body())) > limit+(1<<20) {
+		return http.StatusRequestEntityTooLarge, fmt.Sprintf("Ukuran file melebihi batas %d MB", limit>>20)
+	}
+	if _, err := c.MultipartForm(); err != nil {
 		return http.StatusBadRequest, "Form upload tidak valid (gunakan multipart/form-data)"
 	}
 	return 0, ""
 }
 
 // readUploadedFile membaca field "file" (wajib) lalu memvalidasinya.
-func readUploadedFile(c *gin.Context) (uploadedFile, int, string) {
+func readUploadedFile(c fiber.Ctx) (uploadedFile, int, string) {
 	fh, err := c.FormFile("file")
 	if err != nil || fh == nil {
 		return uploadedFile{}, http.StatusBadRequest, "File dokumen wajib dilampirkan"
@@ -336,6 +334,9 @@ func normalizeDocumentMeta(m *documentMeta, r resolvedTarget, user models.User) 
 	}
 	if m.VersionLabel == "" {
 		m.VersionLabel = "v1.0"
+	}
+	if !validVersionLabel(m.VersionLabel) {
+		return http.StatusBadRequest, "Label versi maksimal 50 karakter dan tidak boleh mengandung pemisah path atau karakter khusus nama file"
 	}
 	if m.AuditTags = strings.TrimSpace(m.AuditTags); m.AuditTags == "" {
 		m.AuditTags = fmt.Sprintf("AUDIT-INT-%d", time.Now().Year())

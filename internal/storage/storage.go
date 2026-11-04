@@ -166,10 +166,6 @@ func Describe() string {
 // IsMinIOLocation: lokasi menunjuk objek MinIO.
 func IsMinIOLocation(location string) bool { return strings.HasPrefix(location, minioScheme) }
 
-func normalizeKey(key string) string {
-	return strings.TrimLeft(strings.ReplaceAll(key, "\\", "/"), "/")
-}
-
 // splitMinIO memecah "minio://bucket/key" menjadi bucket & key.
 func splitMinIO(location string) (string, string, error) {
 	rest := strings.TrimPrefix(location, minioScheme)
@@ -209,7 +205,9 @@ func isNoSuchKey(err error) bool {
 // Exists: file dengan key relatif (mis. "STD.pdf", "_staging/x.pdf") sudah ada di storage aktif.
 func Exists(ctx context.Context, key string) (bool, error) {
 	s := current()
-	key = normalizeKey(key)
+	if err := validateKey(key); err != nil {
+		return false, err
+	}
 	if s.client == nil {
 		_, err := os.Stat(filepath.Join(s.cfg.LocalRoot, filepath.FromSlash(key)))
 		if err == nil {
@@ -235,7 +233,9 @@ func Exists(ctx context.Context, key string) (bool, error) {
 // Save menyimpan file ke storage aktif dan mengembalikan lokasi yang disimpan di database.
 func Save(ctx context.Context, key string, data []byte) (string, error) {
 	s := current()
-	key = normalizeKey(key)
+	if err := validateKey(key); err != nil {
+		return "", err
+	}
 	if s.client == nil {
 		path := filepath.Join(s.cfg.LocalRoot, filepath.FromSlash(key))
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {

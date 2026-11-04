@@ -2,11 +2,7 @@
 -- tandai semua dokumen agar dibaca ulang oleh ReindexPendingDocuments saat backend start.
 
 -- +goose Up
--- +goose StatementBegin
-UPDATE dbo.documents SET content_indexed_at = NULL;
--- +goose StatementEnd
+UPDATE documents SET content_indexed_at = NULL;
 
 -- +goose Down
--- +goose StatementBegin
 SELECT 1;
--- +goose StatementEnd

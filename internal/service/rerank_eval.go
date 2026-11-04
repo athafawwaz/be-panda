@@ -34,6 +34,7 @@ type RerankEvalCase struct {
 	ModelTop       []string `json:"model_top"`
 	ModelLatencyMs int64    `json:"model_latency_ms"`
 	Fallback       string   `json:"fallback,omitempty"` // reranker model gagal pada kasus ini
+	Error          string   `json:"error,omitempty"`
 }
 
 // RerankEvalReport adalah perbandingan heuristik vs reranker model.
@@ -109,6 +110,7 @@ func summarizeRerank(ranks []int, ndcgs []float64) RerankMetrics {
 // RunRerankEval membandingkan heuristik vs reranker model pada pertanyaan uji positif (yang punya expect_docs).
 // Isi potongan hanya dikirim ke reranker bila saklar isi dokumen menyala (sama seperti saat chat).
 func RunRerankEval(ctx context.Context, db *gorm.DB, user models.User, cases []EvalCase, rcfg RerankConfig, shareContent bool) RerankEvalReport {
+	db = db.WithContext(ctx)
 	model := NewReranker(rcfg)
 	report := RerankEvalReport{ContentShared: shareContent}
 	if model != nil {
@@ -128,10 +130,15 @@ func RunRerankEval(ctx context.Context, db *gorm.DB, user models.User, cases []E
 		req := AIChatRequest{Prompt: c.Question, FilterModule: c.FilterModule}
 		a, err := newAgentRun(db, user, req, LLMConfig{Provider: ProviderBuiltin, ShareDocContent: shareContent}, newTracer(false, nil))
 		if err != nil {
+			report.Results = append(report.Results, RerankEvalCase{ID: c.ID, Question: c.Question, Error: err.Error()})
 			continue
 		}
 		a.rerankCfg = rcfg
-		cands, _ := a.searchFiltered(c.Question, docFilter{}, max(rcfg.Candidates, MinRerankCandidates))
+		cands, _, err := a.searchFiltered(c.Question, docFilter{}, max(rcfg.Candidates, MinRerankCandidates))
+		if err != nil {
+			report.Results = append(report.Results, RerankEvalCase{ID: c.ID, Question: c.Question, Error: err.Error()})
+			continue
+		}
 		st := a.tr.begin("tool", "eval")
 		st.Tool = &ToolCallInfo{Name: "search_documents"}
 		topN := max(rcfg.TopN, rerankEvalK)

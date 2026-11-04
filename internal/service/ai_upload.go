@@ -546,8 +546,8 @@ func FindDuplicateInScope(db *gorm.DB, user models.User, sha string) *models.Doc
 func RunStagingJanitor(db *gorm.DB) {
 	for {
 		var expired []models.UploadStaging
-		// Dibandingkan dengan jam SQL Server (lihat catatan zona waktu di handler AnalyzeAIUpload)
-		if err := db.Where("expires_at < SYSDATETIME()").Find(&expired).Error; err == nil {
+		// Dibandingkan dengan jam database (now()), sama seperti saat expires_at ditulis di handler AnalyzeAIUpload
+		if err := db.Where("expires_at < now()").Find(&expired).Error; err == nil {
 			for _, st := range expired {
 				if err := storage.Remove(context.Background(), st.FilePath); err != nil {
 					log.Printf("[AI Upload] file staging %s gagal dihapus: %v", st.FilePath, err)

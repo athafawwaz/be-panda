@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v3"
 
 	"panda-backend/internal/models"
 	"panda-backend/internal/service"
@@ -24,8 +24,8 @@ type rerankSettingsRequest struct {
 	TopN        *int    `json:"top_n"`
 }
 
-func rerankSettingsPayload(cfg service.RerankConfig, shareContent bool) gin.H {
-	return gin.H{
+func rerankSettingsPayload(cfg service.RerankConfig, shareContent bool) fiber.Map {
+	return fiber.Map{
 		"provider":       cfg.Provider,
 		"base_url":       cfg.BaseURL,
 		"model":          cfg.Model,
@@ -74,27 +74,27 @@ func validateRerankSettings(req rerankSettingsRequest) string {
 	return ""
 }
 
-func (h *Handler) GetRerankSettings(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"settings": rerankSettingsPayload(service.LoadRerankConfig(h.DB), service.LoadLLMConfig(h.DB).ShareDocContent)})
+func (h *Handler) GetRerankSettings(c fiber.Ctx) error {
+	return c.Status(http.StatusOK).JSON(fiber.Map{"settings": rerankSettingsPayload(service.LoadRerankConfig(h.DB), service.LoadLLMConfig(h.DB).ShareDocContent)})
 }
 
-func (h *Handler) UpdateRerankSettings(c *gin.Context) {
+func (h *Handler) UpdateRerankSettings(c fiber.Ctx) error {
 	actor := getCurrentUser(c)
 	var req rerankSettingsRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Format setting reranker tidak valid"})
-		return
+	if err := c.Bind().JSON(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Format setting reranker tidak valid"})
+
 	}
 	if msg := validateRerankSettings(req); msg != "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": msg})
+
 	}
 	if err := service.SaveRerankConfig(h.DB, service.RerankConfigUpdate{
 		Provider: req.Provider, BaseURL: req.BaseURL, Model: req.Model, APIKey: req.APIKey, ClearAPIKey: req.ClearAPIKey,
 		Candidates: req.Candidates, TopN: req.TopN,
 	}, actor.BadgeNumber); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan setting reranker"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menyimpan setting reranker"})
+
 	}
 
 	keyAction := "API key tidak diubah"
@@ -116,14 +116,14 @@ func (h *Handler) UpdateRerankSettings(c *gin.Context) {
 			actor.FullName, actor.BadgeNumber, cfg.Provider, cfg.Model, keyAction, cfg.Candidates, cfg.TopN, cfg.Enabled()),
 		ActionTimestamp: time.Now(),
 	})
-	c.JSON(http.StatusOK, gin.H{"settings": rerankSettingsPayload(cfg, service.LoadLLMConfig(h.DB).ShareDocContent)})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"settings": rerankSettingsPayload(cfg, service.LoadLLMConfig(h.DB).ShareDocContent)})
 }
 
 // TestRerankSettings menguji reranker memakai nilai di form (bila diisi) atau setting tersimpan. Yang dikirim hanya
 // kueri & tiga teks contoh, bukan isi dokumen.
-func (h *Handler) TestRerankSettings(c *gin.Context) {
+func (h *Handler) TestRerankSettings(c fiber.Ctx) error {
 	var req rerankSettingsRequest
-	_ = c.ShouldBindJSON(&req)
+	_ = c.Bind().JSON(&req)
 	cfg := service.LoadRerankConfig(h.DB)
 	if p := strings.ToLower(strings.TrimSpace(req.Provider)); p != "" {
 		cfg.Provider = p
@@ -138,27 +138,27 @@ func (h *Handler) TestRerankSettings(c *gin.Context) {
 		cfg.APIKey = strings.TrimSpace(*req.APIKey)
 	}
 	if cfg.Provider == "" || cfg.Provider == service.RerankProviderNone {
-		c.JSON(http.StatusOK, gin.H{"ok": true, "message": "Reranker model tidak aktif — pencarian memakai penilaian ulang heuristik."})
-		return
+		return c.Status(http.StatusOK).JSON(fiber.Map{"ok": true, "message": "Reranker model tidak aktif — pencarian memakai penilaian ulang heuristik."})
+
 	}
 	if msg := validateRerankSettings(rerankSettingsRequest{Provider: cfg.Provider, BaseURL: cfg.BaseURL, Model: cfg.Model}); msg != "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": msg})
+
 	}
 	if cfg.APIKey == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "API key reranker belum diisi"})
-		return
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "API key reranker belum diisi"})
+
 	}
-	scores, docs, latency, err := service.TestReranker(c.Request.Context(), cfg)
+	scores, docs, latency, err := service.TestReranker(c.Context(), cfg)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"ok": false, "message": err.Error(), "latency_ms": latency.Milliseconds()})
-		return
+		return c.Status(http.StatusOK).JSON(fiber.Map{"ok": false, "message": err.Error(), "latency_ms": latency.Milliseconds()})
+
 	}
-	ranking := make([]gin.H, 0, len(scores))
+	ranking := make([]fiber.Map, 0, len(scores))
 	for _, s := range scores {
-		ranking = append(ranking, gin.H{"text": docs[s.Index], "score": s.Score})
+		ranking = append(ranking, fiber.Map{"text": docs[s.Index], "score": s.Score})
 	}
-	c.JSON(http.StatusOK, gin.H{
+	return c.Status(http.StatusOK).JSON(fiber.Map{
 		"ok":         true,
 		"message":    fmt.Sprintf("Terhubung ke %s (%s)", cfg.BaseURL, cfg.Model),
 		"query":      service.RerankTestQuery(),
