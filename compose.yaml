@@ -18,5 +18,26 @@ services:
       retries: 20
       start_period: 5s
 
+  api:
+    build:
+      context: .
+      # Pakai DNS host saat build (go mod download); resolver lokal 127.0.0.53 tidak terlihat dari bridge.
+      network: host
+    env_file: .env
+    environment:
+      # Di dalam jaringan Compose, DB dicapai lewat nama service, bukan 127.0.0.1.
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:${PORT:-8080}:8080"
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+  uploads:

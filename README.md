@@ -1,88 +1,245 @@
-# PANDA — Backend
+# PANDA Backend
 
-API pengelolaan dokumen audit TI: folder tim, aplikasi dan section versi, evidence, audit log, serta pencarian Agentic AI berbasis isi dokumen. Frontend pendamping: [fe-panda](https://github.com/athafawwaz/fe-panda).
+API Go untuk pengelolaan dokumen audit TI. API menerima upload dokumen, data folder tim, aplikasi, section versi, dan evidence. API menghasilkan audit log, pratinjau/unduhan dokumen, serta jawaban Agentic AI berbasis isi dokumen. Frontend pendamping: [fe-panda](https://github.com/athafawwaz/fe-panda).
+
+Data dibatasi per tim dan branch (multi-tenant berbasis role). Startup menjalankan migrasi database. Chat AI dapat berjalan lama (write timeout 20 menit) dan mendukung streaming SSE.
 
 > **Status: PoC, bukan konfigurasi produksi.** Login masih menerima password bypass bersama. Jangan mengekspos layanan ke internet atau memakai data sensitif sebelum autentikasi dan konfigurasi deployment diperkuat.
 
-## Stack dan kebutuhan
+## Table of Contents
 
-- Go 1.26+ sesuai `go.mod` (minimum SDK resmi OpenAI); gunakan rilis patch terbaru yang didukung.
-- Docker dengan Compose untuk PostgreSQL 17 dev, atau server PostgreSQL 17 yang sudah tersedia.
-- Hak perubahan skema pada database pengembangan untuk migrasi saat startup.
-- MinIO opsional. Tanpa kredensial lengkap, file baru disimpan di `uploads/`.
-- LLM dan reranker eksternal opsional; mode builtin dapat dipakai tanpa API key eksternal.
-- HTTP memakai GoFiber v3.6.1. Cancellation chat memerlukan Linux dengan listener TCP/TLS; platform/listener lain gagal eksplisit, bukan mengabaikan disconnect.
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Environment Configuration](#environment-configuration)
+- [Docker Compose](#docker-compose)
+- [Authentication](#authentication)
+- [API Overview](#api-overview)
+- [Development](#development)
+- [Panduan untuk AI Agent](#panduan-untuk-ai-agent)
+- [Troubleshooting](#troubleshooting)
+- [Sebelum Produksi](#sebelum-produksi)
 
-### Lifecycle HTTP dan stream
+## Requirements
 
-Handler memakai `func(fiber.Ctx) error`, validasi required tetap melalui validator yang sudah tersedia. Error HTTP berbentuk `{"error":"..."}`. CORS menggunakan Bearer header tanpa wildcard credentials.
+Kebutuhan berbeda untuk jalur Docker penuh dan jalur API di host.
 
-Chat JSON memakai context terpisah yang dibatalkan saat socket peer putus. Poll metadata socket setiap 10 ms tidak membaca/menulis byte TCP/TLS; ini bukan jaminan Stop 10 ms melewati proxy. SSE memakai middleware bawaan Fiber, heartbeat 15 detik, dan context socket yang sama. Callback menangkap request/identitas yang dimiliki sendiri; tidak meneruskan pooled Ctx ke service. `done` hanya dikirim setelah penyimpanan berhasil.
+- Docker dengan Compose v2 (jalur Docker penuh, atau PostgreSQL saja).
+- Go 1.26+ sesuai `go.mod`, hanya untuk menjalankan API di host atau menjalankan tes.
+- PostgreSQL 17. Compose sudah menyediakannya; server lain juga dapat dipakai.
+- Opsional: MinIO, LLM eksternal, dan reranker eksternal. Tanpa itu, file disimpan di `uploads/` dan AI memakai mode builtin.
+- Cancellation chat memerlukan Linux dengan listener TCP/TLS. Platform lain gagal secara eksplisit.
 
-Timeout server: read 30 detik, idle 60 detik, write 20 menit agar Thinking dan final generation tidak terpotong terlalu cepat. WriteTimeout merupakan ceiling seluruh respons, bukan idle timeout per chunk. Proxy harus mendukung respons lama dan meneruskan disconnect; smoke jalur deployment sebenarnya masih diperlukan.
+## Quick Start
 
-Batas body sebelum multipart parsing adalah `UPLOAD_MAX_MB` + overhead 1 MiB (default file 25 MiB). Setelah parsing, ukuran dan isi file diperiksa lagi. Download tetap streaming, termasuk Range tunggal/multipart, HEAD dan conditional request; reader ditutup oleh lifecycle respons.
-
-Verifikasi migrasi:
-
-```sh
-go test ./...
-go test -race ./...
-go vet ./...
-go build ./...
-go test -race -tags integration ./internal/service -run Integration -count=1
-go test -race ./internal/httptransport -count=10
-```
-
-Tes TCP/TLS dan reverse proxy lokal bukan bukti provider eksternal atau proxy produksi. Rollback pergantian framework melalui executable/revisi sebelumnya; tidak ada migrasi skema khusus Fiber.
-
-## Mulai cepat
-
-Jalankan seluruh perintah berikut dari root repo backend.
+Jalankan semua perintah dari root repo backend. Mulai dengan file env:
 
 ```bash
 cp .env.example .env
-go mod download
 ```
 
-Edit `.env` sebelum menjalankan API:
+Isi dua secret wajib di `.env`. Contoh membuat nilai acak:
 
-1. Isi `DB_PASSWORD` acak. Default Compose: `DB_HOST=127.0.0.1`, `DB_PORT=5432`, `DB_USER=panda_user`, `DB_NAME=panda`, dan `DB_SSLMODE=disable` (khusus lokal). Compose membuat user/database pada volume baru.
-2. Ganti `JWT_SECRET` dengan nilai acak minimal 32 karakter, bukan placeholder. Contoh membuat nilai acak menggunakan Node.js:
+```bash
+openssl rand -hex 24   # untuk DB_PASSWORD
+openssl rand -hex 32   # untuk JWT_SECRET (minimal 32 karakter)
+```
 
-   ```bash
-   node -e 'console.log(require("node:crypto").randomBytes(32).toString("hex"))'
-   ```
+```text
+DB_PASSWORD=<hasil openssl rand -hex 24>
+JWT_SECRET=<hasil openssl rand -hex 32>
+```
 
-3. Simpan hasilnya sebagai `JWT_SECRET` di `.env`. Jangan masukkan secret ke Git.
+Pilih satu cara menjalankan API.
+
+**A. Docker penuh (API + PostgreSQL):**
+
+```bash
+docker compose up -d --build --wait
+```
+
+**B. API di host, PostgreSQL di Docker:**
 
 ```bash
 docker compose up -d --wait postgres
 go run ./cmd/api
 ```
 
-API tersedia di `http://localhost:8080/api/v1`, kecuali `PORT` diubah. Endpoint publik untuk pengecekan awal: `GET /api/v1/public/stats`; endpoint ini membaca database, bukan liveness check yang independen dari database.
+API mendengarkan di `http://127.0.0.1:8080/api/v1`. Cek awal:
 
-**Startup mengubah database.** API menjalankan migrasi Goose, GORM AutoMigrate, dan seeding master tim/branch serta akun awal. Kegagalan migrasi/sinkronisasi/seed menghentikan startup. Gunakan database khusus pengembangan dan backup sebelum upgrade.
+```bash
+curl -s http://127.0.0.1:8080/api/v1/public/stats
+```
 
-### Database Docker lokal
+Endpoint ini membaca database, jadi ini bukan liveness check yang terpisah dari database.
 
-`compose.yaml` hanya menjalankan PostgreSQL; BE/FE tetap dijalankan di host. Port DB dibatasi ke `127.0.0.1`. Data disimpan di named volume `panda-dev_postgres_data`.
+**Startup mengubah database.** API menjalankan migrasi Goose, GORM AutoMigrate, dan seeding master tim/branch serta akun awal. Kegagalan langkah ini menghentikan startup. Gunakan database khusus pengembangan dan backup sebelum upgrade.
+
+## Environment Configuration
+
+Semua variabel dibaca dari environment proses, lalu dari `.env` di working directory, lalu `../.env`. Nilai environment proses selalu menang. Template lengkap ada di [`.env.example`](.env.example).
+
+### Secret wajib
+
+| Variable | Description |
+|:---|:---|
+| `DB_PASSWORD` | Password PostgreSQL. Kosong membuat startup gagal. Compose memakai nilai ini saat membuat volume baru. |
+| `JWT_SECRET` | Penandatangan JWT dan sumber kunci enkripsi API key AI tersimpan. Minimal 32 karakter, tanpa `<` atau `>`. |
+
+### Nilai runtime infrastruktur
+
+| Variable | Default | Description |
+|:---|---:|:---|
+| `PORT` | `8080` | Port HTTP. Di Compose, juga port host untuk service `api`. |
+| `DB_HOST` | `localhost` | Host PostgreSQL. `.env.example` memakai `127.0.0.1`. Compose menimpa menjadi `postgres` untuk service `api`. |
+| `DB_PORT` | `5432` | Port PostgreSQL. |
+| `DB_USER` | `panda_user` | User PostgreSQL. |
+| `DB_NAME` | `panda` | Nama database. |
+| `DB_SSLMODE` | `disable` | `disable` hanya untuk Docker lokal. Gunakan `verify-full` untuk server ber-TLS. |
+| `UPLOAD_MAX_MB` | `25` | Ukuran maksimum per file, dalam MB. |
+| `INITIAL_ADMIN_BADGE` | `2411249` | Badge akun Super Admin yang dibuat saat startup jika belum ada. |
+| `BYPASS_PASSWORD` | `Panda` | Password bersama khusus PoC. Diterima untuk semua akun, tanpa beda huruf besar/kecil. |
+
+### Integrasi opsional
+
+| Variable | Default | Description |
+|:---|---:|:---|
+| `MINIO_ENDPOINT` | (kosong) | `host:port` atau URL lengkap. `https://` mengaktifkan SSL. |
+| `MINIO_ACCESS_KEY` | (kosong) | Access key MinIO. |
+| `MINIO_SECRET_KEY` | (kosong) | Secret key MinIO. |
+| `MINIO_BUCKET` | (kosong) | Nama bucket. `.env.example` memakai `panda-documents`. |
+| `MINIO_USE_SSL` | `false` | `true` atau `1` mengaktifkan TLS. |
+| `MINIO_REGION` | (kosong) | Region MinIO. |
+| `LLM_PROVIDER` | `builtin` | `builtin` atau provider OpenAI-compatible. Jika kosong dan `LLM_API_KEY` terisi, menjadi `custom`. |
+| `LLM_BASE_URL` | `https://api.openai.com/v1` | Endpoint LLM. |
+| `LLM_MODEL` | `gpt-4o-mini` | Model LLM. |
+| `LLM_API_KEY` | (kosong) | API key LLM. |
+| `LLM_SHARE_DOC_CONTENT` | `false` | Izin mengirim isi dokumen ke LLM eksternal. |
+| `LLM_CHAT_HISTORY_TURNS` | `10` | Jumlah tanya-jawab terakhir yang dibaca AI, 0-30. |
+| `LLM_THINKING_MAX_STEPS` | `0` | Batas langkah mode Thinking. `0` = tanpa batas, selain itu 2-40. |
+| `RERANK_PROVIDER` | `none` | `none`, `cohere`, `jina`, `voyage`, atau `custom`. |
+| `RERANK_BASE_URL` | (preset) | Kosong memakai preset provider. Wajib untuk `custom`. |
+| `RERANK_MODEL` | (preset) | Kosong memakai preset provider. Wajib untuk `custom`. |
+| `RERANK_API_KEY` | (kosong) | API key reranker. |
+| `RERANK_CANDIDATES` | `30` | Jumlah kandidat, 5-50. |
+| `RERANK_TOP_N` | `8` | Jumlah hasil, 1-8. |
+
+Pengaturan LLM dan reranker yang disimpan dari menu Super Admin selalu menang atas environment.
+
+`.env` dan `.env.*` sudah ada di `.gitignore`; jangan commit secret. Pada deployment, berikan nilai yang sama melalui secret platform, bukan file `.env` di image.
+
+## Docker Compose
+
+`compose.yaml` (project `panda-dev`) menjalankan PostgreSQL 17 dan API backend. Kedua port hanya terbuka di `127.0.0.1`.
+
+```bash
+docker compose up -d --build --wait
+```
+
+| Service | Port host | Volume | Catatan |
+|:---|:---|:---|:---|
+| `postgres` | `127.0.0.1:${DB_PORT:-5432}` | `panda-dev_postgres_data` | Health check `pg_isready`. |
+| `api` | `127.0.0.1:${PORT:-8080}` | `panda-dev_uploads` → `/app/uploads` | Start setelah `postgres` sehat. Image distroless, user nonroot. |
+
+Service `api` membaca `.env`, lalu menimpa `DB_HOST=postgres`, `DB_PORT=5432`, dan `PORT=8080` di dalam container.
 
 ```bash
 docker compose ps
-docker compose logs --tail 50 postgres
-docker compose stop postgres
-docker compose up -d --wait postgres
+docker compose logs --tail 50 api
+docker compose up -d --build api   # rebuild setelah perubahan kode
+docker compose down                # data tetap ada di volume
 ```
 
-`docker compose down` mempertahankan volume. **Jangan tambah `-v` kecuali memang ingin menghapus seluruh data.** Mengubah `DB_PASSWORD` pada `.env` tidak mengganti password role yang sudah ada di volume. Default user image Docker adalah superuser untuk dev; gunakan role terbatas untuk produksi.
+Penting:
 
-Port ini ditujukan untuk **database PostgreSQL baru**, bukan migrasi isi SQL Server lama. Backup/export dan transfer data SQL Server memerlukan langkah terpisah.
+- **Jangan pakai `docker compose down -v`** kecuali memang ingin menghapus database dan file upload.
+- Mengubah `DB_PASSWORD` di `.env` tidak mengganti password role yang sudah ada di volume.
+- Build memakai `network: host`, jadi `go mod download` memakai DNS host. Resolver lokal seperti `127.0.0.53` tidak terlihat dari jaringan bridge Docker.
+- User default image PostgreSQL adalah superuser untuk dev. Gunakan role terbatas untuk produksi.
+- Platform deployment dapat memberikan variabel yang sama secara langsung tanpa Compose.
 
-### Auto reload backend
+## Authentication
 
-Pasang Air pada user (tidak mengubah dependency aplikasi), kemudian jalankan dari root backend:
+Login dengan badge dan password. Respons berisi `token` (JWT HS256, berlaku 72 jam) dan `user`.
+
+```text
+POST /api/v1/auth/login
+Content-Type: application/json
+
+{"badge_number":"2411249","password":"Panda"}
+```
+
+Kirim token di header untuk semua endpoint terproteksi:
+
+```text
+Authorization: Bearer <token>
+```
+
+Token di query string **tidak** diterima, termasuk untuk pratinjau/unduhan dokumen. Akses ke dokumen/aplikasi di luar scope mengembalikan `404`.
+
+Super Admin dapat melihat data sebagai tim/branch lain (read-only, kecuali POST chat AI) dengan header:
+
+```text
+X-Impersonate-Team: <team_id>
+X-Impersonate-Branch: <branch_id>
+```
+
+| Role | Akses |
+|:---|:---|
+| `SUPER_ADMIN` | Akses penuh, pengaturan AI/reranker, impersonation. |
+| `ADMIN` | Semua tim, master data, dan folder. |
+| `PEGAWAI_TI` | Tim/branch sendiri. Dokumen `ALL_TIM` terlihat lintas tim. |
+
+**Rotasi `JWT_SECRET`** membatalkan token lama. API key LLM/reranker yang tersimpan juga perlu diisi ulang, karena dienkripsi dengan secret ini.
+
+## API Overview
+
+Error memakai satu bentuk JSON:
+
+```json
+{"error": "Pesan error dalam Bahasa Indonesia"}
+```
+
+Semua path relatif terhadap `/api/v1`.
+
+| Group | Endpoints |
+|:---|:---|
+| Publik | `GET /public/stats`, `POST /auth/login` |
+| Identitas | `GET /auth/me`, `GET /dashboard/summary` |
+| Master tim | `GET /master/teams`, `POST /master/teams`, `PUT /master/teams/:id`, `DELETE /master/teams/:id` |
+| Master branch | `POST /master/branches`, `PUT /master/branches/:id`, `DELETE /master/branches/:id` |
+| Master user | `GET /master/users`, `POST /master/users`, `PUT /master/users/:id`, `DELETE /master/users/:id` |
+| Folder dan aplikasi | `GET /folders`, `POST /folders`, `POST /folders/:id/applications`, `GET /applications/:id`, `POST /applications/:id/sections` |
+| Dokumen | `GET /evidence`, `POST /documents/upload`, `GET /documents/:id/preview`, `GET /documents/:id/download` |
+| Audit | `GET /logs` |
+| Chat AI | `POST /ai/chat`, `POST /ai/chat/stream`, `GET /ai/chat/shortcuts`, `GET /ai/chat/sessions`, `GET /ai/chat/sessions/:id`, `DELETE /ai/chat/sessions/:id`, `GET /ai/quota` |
+| Upload AI | `POST /ai/upload/analyze`, `POST /ai/upload/confirm`, `DELETE /ai/upload/:id` |
+| Super Admin | `GET /admin/settings/ai`, `PUT /admin/settings/ai`, `POST /admin/settings/ai/test`, `GET /admin/settings/ai/quota`, `PUT /admin/settings/ai/quota`, `GET /admin/settings/rerank`, `PUT /admin/settings/rerank`, `POST /admin/settings/rerank/test` |
+
+Tidak ada query parameter yang dipakai bersama oleh banyak endpoint. Sumber kebenaran route: [`cmd/api/main.go`](cmd/api/main.go). Handler tetap memeriksa role tambahan.
+
+Perilaku penting:
+
+- **Upload:** batas body `UPLOAD_MAX_MB` + 1 MiB sebelum parsing multipart. Ukuran dan isi file diperiksa lagi setelahnya. Label versi maksimal 50 karakter.
+- **Download:** streaming, mendukung Range, HEAD, dan conditional request.
+- **Chat SSE:** heartbeat 15 detik, event `answer_delta`/`answer_reset`, lalu satu event terminal `done` atau `error`. `done` dikirim hanya setelah penyimpanan berhasil.
+- **Timeout server:** read 30 detik, idle 60 detik, write 20 menit. Reverse proxy harus mendukung respons lama.
+- **Storage:** MinIO aktif jika endpoint, key, secret, dan bucket terisi. Jika MinIO aktif tetapi tidak dapat diakses, upload gagal; tidak ada fallback diam-diam ke lokal. Backup database **dan** file/bucket.
+
+## Development
+
+Perintah yang paling sering dipakai:
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+go build -o bin/panda-api ./cmd/api
+go test -race -tags integration ./internal/service -run Integration -count=1
+```
+
+Tes integration membuat database `panda_ragit_<uuid>` lalu menghapusnya; akun DB memerlukan hak `CREATEDB`. `PANDA_IT_DB_NAME` hanya boleh menunjuk database test kosong. Evaluasi retrieval: [`eval/README.md`](eval/README.md).
+
+Auto reload dengan Air (dipasang di level user, bukan dependency aplikasi):
 
 ```bash
 GOBIN="$HOME/.local/bin" go install github.com/air-verse/air@v1.67.4
@@ -94,138 +251,78 @@ GOBIN="$HOME/.local/bin" go install github.com/air-verse/air@v1.67.4
   --build.stop_on_error true
 ```
 
-### Menjalankan lewat tool `proc`
-
-Bila menggunakan agent dengan tool `proc`, panggil dari agent, bukan sebagai perintah shell:
-
-```json
-{
-  "action": "start",
-  "command": "go run ./cmd/api",
-  "cwd": "/path/to/backend",
-  "name": "PANDA backend"
-}
-```
-
-Simpan handle `proc-*` yang dikembalikan. Gunakan `action: "logs"` atau `action: "stop"` dengan `handle` tersebut untuk melihat log atau menghentikan proses.
-
-## Konfigurasi
-
-Daftar lengkap dan nilai contoh ada di [`.env.example`](.env.example). Environment proses mengalahkan nilai `.env`; aplikasi mencoba memuat `.env` di working directory lalu `../.env`. Jalankan dari root backend agar lokasi file konsisten.
-
-| Variabel | Kegunaan |
-| --- | --- |
-| `PORT` | Port HTTP; default `8080`. |
-| `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | Koneksi PostgreSQL; default lokal `127.0.0.1:5432`, user `panda_user`, database `panda`. Password wajib diisi. |
-| `DB_SSLMODE` | `disable` untuk Docker lokal, `verify-full` untuk server remote dengan sertifikat tepercaya. |
-| `JWT_SECRET` | Penandatangan JWT sekaligus sumber kunci enkripsi API key AI tersimpan. Wajib acak, minimal 32 karakter, tanpa placeholder `<...>`. |
-| `INITIAL_ADMIN_BADGE` | Badge akun Super Admin awal; default PoC `2411249`. Startup memastikan badge ini memiliki role Super Admin. |
-| `BYPASS_PASSWORD` | Password login bersama khusus PoC; default `Panda`. Bukan password produksi. |
-| `UPLOAD_MAX_MB` | Batas ukuran file upload; contoh `25` MB. |
-| `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_BUCKET` | Mengaktifkan penyimpanan MinIO bila seluruhnya terisi. |
-| `MINIO_USE_SSL`, `MINIO_REGION` | TLS dan region MinIO. |
-| `LLM_PROVIDER`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | Provider/model AI. Pengaturan tersimpan melalui menu Super Admin diprioritaskan atas konfigurasi environment. |
-| `LLM_SHARE_DOC_CONTENT` | Izin mengirim isi dokumen ke provider AI eksternal; contoh `false`. |
-| `RERANK_PROVIDER`, `RERANK_BASE_URL`, `RERANK_MODEL`, `RERANK_API_KEY` | Reranker opsional; contoh provider `none`. |
-
-### Penyimpanan dan pekerjaan latar
-
-- Lokal: file dan staging berada di `uploads/`, relatif terhadap working directory. Jangan commit direktori ini.
-- MinIO: ketika diaktifkan tetapi tidak dapat diakses, operasi upload gagal; layanan tidak diam-diam berpindah ke lokal. Dokumen lokal lama tetap dapat dibaca.
-- Startup menjalankan pengindeksan dokumen yang tertunda dan pembersihan staging upload kedaluwarsa di latar.
-- Backup database **dan** file lokal/bucket MinIO. Backup database saja tidak mencakup isi dokumen.
-
-## Login dan aturan akses
-
-Untuk database baru dengan konfigurasi contoh, akun awal menggunakan badge `2411249` dan password bypass `Panda`. Akun harus terdaftar dan aktif. Mengubah `BYPASS_PASSWORD` saja **bukan** migrasi password akun yang sudah tersimpan.
-
-- `SUPER_ADMIN`: akses penuh, pengaturan AI, dan impersonation segmen.
-- `ADMIN`: akses seluruh tim serta pengelolaan master data/folder.
-- `PEGAWAI_TI`: dibatasi tim/branch, dengan dokumen `ALL_TIM` dapat dilihat lintas tim.
-- Impersonation bersifat read-only; chat AI dan streaming merupakan pengecualian POST yang diizinkan.
-
-API terproteksi menerima `Authorization: Bearer <token>`. Token query string tidak diterima. JWT wajib HS256 dan memiliki `exp`. Preview/download juga memerlukan Bearer token dan pemeriksaan scope; akses dokumen/aplikasi di luar scope mengembalikan `404`.
-
-**Rotasi `JWT_SECRET`:** token lama tidak berlaku lagi. Karena secret juga dipakai untuk enkripsi pengaturan, API key LLM/reranker tersimpan dapat perlu diisi ulang. Rencanakan rotasi, jangan menggantinya sembarangan saat restart.
-
-## Peta endpoint
-
-Semua path di bawah relatif terhadap `/api/v1`.
-
-| Area | Endpoint utama |
-| --- | --- |
-| Publik | `GET /public/stats`, `POST /auth/login` |
-| Identitas/dashboard | `GET /auth/me`, `GET /dashboard/summary` |
-| Master akses | `/master/teams`, `/master/branches`, `/master/users` |
-| Aplikasi | `/folders`, `/folders/:id/applications`, `/applications/:id`, `/applications/:id/sections` |
-| Dokumen | `GET /evidence`, `POST /documents/upload`, `GET /documents/:id/preview`, `GET /documents/:id/download` |
-| Audit | `GET /logs` |
-| Chat AI | `POST /ai/chat`, `POST /ai/chat/stream`, `/ai/chat/sessions`, `GET /ai/quota` |
-| Upload AI | `POST /ai/upload/analyze`, `POST /ai/upload/confirm`, `DELETE /ai/upload/:id` |
-| Super Admin | `/admin/settings/ai`, `/admin/settings/rerank` dan endpoint kuotanya |
-
-Metode dan route lengkap: [`cmd/api/main.go`](cmd/api/main.go). Validasi role tambahan tetap berlaku pada handler; tidak semua pengguna terautentikasi boleh mengubah master data.
-
-## Alur chat AI
-
-- Handler JSON dan SSE di `internal/handler/ai_chat.go` memakai satu use case `service.RunChat`. Service menjalankan harness, lalu menyimpan audit, sesi, dan pesan dalam satu transaksi; ID hasil hanya diberikan setelah commit. Impersonation hanya mencatat audit atas akun asli, tanpa menambah riwayat.
-- SSE meneruskan progres dan `answer_delta`/`answer_reset`, lalu satu event terminal `done` atau `error`. `done` berarti penyimpanan berhasil. Pembatalan request atau kegagalan write/flush membatalkan pekerjaan; heartbeat berhenti sebelum handler keluar.
-- Tool calling memakai SDK resmi `openai-go/v3`: parameter/definisi function bertipe, endpoint dan API key dari konfigurasi PANDA, tanpa retry otomatis SDK. Harness tetap memiliki otorisasi, validasi argumen, eksekusi tool, dan budget; SDK bukan agent runner.
-- Parser respons kompatibilitas tetap dipakai untuk menolak stream terputus serta mempertahankan `extra_content`/thought signature Gemini. Analisis upload dan tes koneksi teks biasa di `llm_client.go` belum memakai SDK ini.
-
-## Tes dan build
-
-Dengan dependency tersedia:
-
-```bash
-go test ./...
-go vet ./...
-go build -o bin/panda-api ./cmd/api
-```
-
-Tes regresi berikut hanya memakai standard library dan dapat dijalankan tanpa dependency pihak ketiga:
-
-```bash
-go test cmd/api/authorization_test.go -v
-go test internal/handler/version.go internal/handler/version_test.go -v
-go test internal/storage/key.go internal/storage/key_test.go -v
-```
-
-Tes route di `cmd/api/authorization_test.go` memeriksa struktur source/AST; itu bukan pengganti tes HTTP dan database end-to-end. Tes validator menjalankan fungsi validasi yang digunakan aplikasi.
-
-Tes PostgreSQL sungguhan bersifat opt-in:
-
-```bash
-go test -tags integration ./internal/service -run Integration -v
-```
-
-Mode integration membuat database unik `panda_ragit_<uuid>` lalu menghapusnya setelah selesai; akun test memerlukan hak `CREATEDB`. Jalankan pada PostgreSQL dev/test terisolasi. Alternatif `PANDA_IT_DB_NAME` harus menunjuk database kosong khusus test, tidak pernah database dev/produksi. Tes menerapkan migrasi, seed, dan menulis data pada database tersebut.
-
-Evaluasi kualitas retrieval: baca [`eval/README.md`](eval/README.md).
-
-## Struktur repo
+Migrasi SQL ada di `internal/database/migrations/` (Goose, ter-embed ke binary).
 
 ```text
 cmd/api/             Entrypoint HTTP dan registrasi route
 cmd/rag-eval/        CLI evaluasi retrieval
-internal/handler/   HTTP, otorisasi, upload, dan chat
-internal/service/   AI/RAG, scope data, dan konfigurasi
-internal/storage/   File lokal dan MinIO
-internal/database/  Koneksi, migrasi SQL, dan seeding
-internal/models/    Model data
+internal/handler/    HTTP, otorisasi, upload, dan chat
+internal/service/    AI/RAG, scope data, dan konfigurasi
+internal/storage/    File lokal dan MinIO
+internal/database/   Koneksi, migrasi SQL, dan seeding
+internal/models/     Model data
 ```
+
+## Panduan untuk AI Agent
+
+Bagian ini untuk coding agent (Claude Code, pi, Codex, dan sejenisnya) yang bekerja di repo ini. Ikuti urutan dan aturan berikut.
+
+### Aturan keras
+
+1. **Jangan baca, tampilkan, atau commit `.env`.** Pakai `.env.example` sebagai referensi nama variabel. Untuk nilai secret, minta user atau gunakan tool env yang disetujui user.
+2. **Jangan jalankan `docker compose down -v`** atau `DROP DATABASE` tanpa persetujuan eksplisit. Volume berisi data dev dan file upload.
+3. **Jangan jalankan tes integration ke database dev.** Tes ini menulis data; pakai database unik bawaan tes.
+4. **Jangan ubah `JWT_SECRET` atau `DB_PASSWORD`** di environment yang sudah berisi data. Lihat catatan rotasi di [Authentication](#authentication) dan [Docker Compose](#docker-compose).
+5. Jalankan semua perintah dari root repo backend, karena `.env` dan `uploads/` relatif terhadap working directory.
+
+### Menjalankan dan memverifikasi
+
+| Tujuan | Perintah |
+|:---|:---|
+| Menjalankan stack penuh | `docker compose up -d --build --wait` |
+| Menjalankan API di host | `docker compose up -d --wait postgres`, lalu `go run ./cmd/api` sebagai proses latar |
+| Smoke test | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/public/stats` harus `200` |
+| Melihat log | `docker compose logs --tail 50 api` |
+| Verifikasi sebelum commit | `go vet ./...` lalu `go test ./...` |
+
+`go run ./cmd/api` dan `air` tidak pernah selesai. Jalankan lewat tool proses latar milik agent (misalnya `proc` dengan `action: "start"`, `cwd` = root backend), bukan `bash` dengan `&` atau `sleep`. Simpan handle yang dikembalikan untuk `logs` dan `stop`.
+
+### Peta perubahan
+
+| Jika mengubah | Juga perbarui |
+|:---|:---|
+| Route di `cmd/api/main.go` | Tes `cmd/api/authorization_test.go` dan `cmd/api/http_contract_test.go`, tabel [API Overview](#api-overview) |
+| Skema database | File migrasi baru di `internal/database/migrations/` dengan nomor berikutnya (`00011_...sql`). Jangan edit migrasi yang sudah ada. |
+| Variabel env baru | `.env.example` (dengan komentar) dan tabel [Environment Configuration](#environment-configuration) |
+| Ekstraksi, chunking, atau pencarian RAG | Bandingkan dengan baseline melalui [`eval/README.md`](eval/README.md) |
+| `Dockerfile` atau `compose.yaml` | `docker compose config -q`, lalu build dan smoke test |
+
+### Konvensi
+
+- Pesan error API dan komentar kode memakai Bahasa Indonesia. Pertahankan gaya ini.
+- Handler memakai `func(fiber.Ctx) error` (GoFiber v3). Jangan teruskan `fiber.Ctx` ke service atau goroutine; salin nilai yang dibutuhkan.
+- Error HTTP selalu `{"error":"..."}`.
+- Akses dokumen di luar scope mengembalikan `404`, bukan `403`, agar keberadaan data tidak bocor.
+- Gunakan dependency yang sudah ada di `go.mod` sebelum menambah yang baru.
 
 ## Troubleshooting
 
 | Gejala | Pemeriksaan |
-| --- | --- |
-| `Invalid JWT configuration` | Isi secret acak minimal 32 karakter; hapus placeholder. |
+|:---|:---|
+| `Invalid JWT configuration` | Isi `JWT_SECRET` acak minimal 32 karakter, tanpa placeholder. |
 | `DB_PASSWORD belum diisi` / koneksi PostgreSQL gagal | Periksa `.env`, `docker compose ps`, working directory, user/database, dan port `5432`. |
-| `module lookup disabled by GOPROXY=off` | Modul belum ada di cache; izinkan akses registry lalu jalankan `go mod download`. |
-| Dokumen `401` / `404` | Periksa Bearer token, masa berlaku, serta scope tim/branch. URL dokumen bukan tautan publik. |
-| Peringatan MinIO | Lengkapi kredensial dan cek bucket/TLS/jaringan; kosongkan kredensial hanya bila memang memilih storage lokal. |
+| Build Docker gagal di `go mod download` | Periksa DNS host. Build sudah memakai `network: host`; pastikan host dapat me-resolve `proxy.golang.org`. |
+| `module lookup disabled by GOPROXY=off` | Modul belum ada di cache. Izinkan akses registry lalu jalankan `go mod download`. |
+| Dokumen `401` / `404` | Periksa Bearer token, masa berlaku, dan scope tim/branch. URL dokumen bukan tautan publik. |
+| Peringatan MinIO saat startup | Lengkapi kredensial dan cek bucket/TLS/jaringan. Kosongkan kredensial hanya jika memilih storage lokal. |
 | Upload versi ditolak | Label versi maksimal 50 karakter, tanpa pemisah path atau karakter khusus nama file. |
 
-## Sebelum produksi
+## Sebelum Produksi
 
-Cabut bypass login dan penyimpanan password PoC, audit dependency, gunakan HTTPS serta pembatasan akses jaringan, tinjau CORS dan TLS PostgreSQL, dan verifikasi isolasi tim/branch dengan tes end-to-end. Jangan memakai role superuser Docker dev pada produksi.
+Langkah berikut wajib sebelum layanan dipakai di produksi.
+
+- Cabut bypass login dan penyimpanan password PoC.
+- Gunakan HTTPS dan batasi akses jaringan. Tinjau CORS dan TLS PostgreSQL.
+- Gunakan role PostgreSQL terbatas, bukan superuser Docker dev.
+- Audit dependency dan verifikasi isolasi tim/branch dengan tes end-to-end.
+- Port ini untuk database PostgreSQL baru. Data SQL Server lama memerlukan migrasi terpisah.
