@@ -2,19 +2,20 @@
 
 package service
 
-// Integration test terhadap SQL Server sungguhan: membuat database sementara, menjalankan semua migrasi,
-// mengindeks dokumen buatan, lalu menguji pencarian Agentic AI. Database dihapus setelah test selesai.
+// Integration test terhadap PostgreSQL sungguhan: membuat database sementara dengan nama unik, menjalankan semua
+// migrasi, mengindeks dokumen buatan, lalu menguji pencarian Agentic AI. Database dihapus setelah test selesai.
 //
 //	go test -tags integration ./internal/service -run Integration -v
 //
-// Kredensial dibaca dari backend/.env (DB_HOST, DB_PORT, DB_USER, DB_PASSWORD); nama database PandaDB_RagIT.
-// Bila user database tidak punya izin CREATE DATABASE, siapkan database kosong khusus test lalu jalankan dengan
+// Kredensial dibaca dari file env backend (DB_HOST, DB_PORT, DB_USER, DB_PASSWORD); koneksi awal ke database "postgres".
+// Bila user database tidak punya izin CREATEDB, siapkan database kosong khusus test lalu jalankan dengan
 // PANDA_IT_DB_NAME=<nama>: migrasi diterapkan ke database itu dan data uji dihapus lagi setelah test (database tidak di-drop).
 // Jangan arahkan PANDA_IT_DB_NAME ke database dev/produksi.
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,8 +34,6 @@ import (
 	"panda-backend/internal/models"
 )
 
-const integrationDBName = "PandaDB_RagIT"
-
 // integrationDocIDs: dokumen yang dibuat test, dihapus lagi saat memakai database test yang sudah ada.
 var integrationDocIDs []string
 
@@ -51,48 +50,63 @@ func openIntegrationDB(t *testing.T) *gorm.DB {
 		}
 		t.Cleanup(func() {
 			for _, id := range integrationDocIDs {
-				db.Where("document_id = ?", id).Delete(&models.DocumentChunkTerm{})
-				db.Where("document_id = ?", id).Delete(&models.DocumentChunk{})
-				db.Where("id = ?", id).Delete(&models.Document{})
+				for _, del := range []struct {
+					model any
+					col   string
+				}{{&models.DocumentChunkTerm{}, "document_id"}, {&models.DocumentChunk{}, "document_id"}, {&models.Document{}, "id"}} {
+					if err := db.Where(del.col+" = ?", id).Delete(del.model).Error; err != nil {
+						t.Errorf("cleanup dokumen uji %s gagal: %v", id, err)
+					}
+				}
 			}
-			if sqlDB, err := db.DB(); err == nil {
-				sqlDB.Close()
-			}
+			closeIntegrationDB(t, db)
 		})
 		return db
 	}
 
-	t.Setenv("DB_NAME", "master")
-	master, err := database.Connect()
+	t.Setenv("DB_NAME", "postgres")
+	admin, err := database.Connect()
 	if err != nil {
-		t.Skipf("SQL Server tidak tersedia: %v", err)
+		t.Skipf("PostgreSQL tidak tersedia: %v", err)
 	}
-	dropDB := func() {
-		master.Exec(fmt.Sprintf("IF DB_ID('%s') IS NOT NULL BEGIN ALTER DATABASE [%s] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [%s]; END",
-			integrationDBName, integrationDBName, integrationDBName))
-	}
-	dropDB()
-	if err := master.Exec("CREATE DATABASE [" + integrationDBName + "]").Error; err != nil {
-		t.Skipf("tidak bisa membuat database sementara (izin CREATE DATABASE?): %v — atau set PANDA_IT_DB_NAME ke database kosong khusus test", err)
+	// Nama unik per run: tidak pernah menyentuh database lain yang sudah ada.
+	name := "panda_ragit_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if err := admin.Exec(`CREATE DATABASE "` + name + `"`).Error; err != nil {
+		closeIntegrationDB(t, admin)
+		t.Skipf("tidak bisa membuat database sementara (izin CREATEDB?): %v — atau set PANDA_IT_DB_NAME ke database kosong khusus test", err)
 	}
 	t.Cleanup(func() {
-		if sqlDB, err := master.DB(); err == nil {
-			dropDB()
-			sqlDB.Close()
+		if err := admin.Exec(`DROP DATABASE "` + name + `" WITH (FORCE)`).Error; err != nil {
+			t.Errorf("gagal menghapus database sementara %s: %v", name, err)
 		}
+		closeIntegrationDB(t, admin)
 	})
 
-	t.Setenv("DB_NAME", integrationDBName)
+	t.Setenv("DB_NAME", name)
 	db, err := database.ConnectAndMigrate()
 	if err != nil {
 		t.Fatalf("migrasi database sementara gagal: %v", err)
 	}
-	t.Cleanup(func() {
-		if sqlDB, err := db.DB(); err == nil {
-			sqlDB.Close()
-		}
-	})
+	t.Cleanup(func() { closeIntegrationDB(t, db) })
 	return db
+}
+
+func closeIntegrationDB(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	sqlDB, err := db.DB()
+	if err == nil {
+		err = sqlDB.Close()
+	}
+	if err != nil {
+		t.Errorf("gagal menutup koneksi database: %v", err)
+	}
+}
+
+func cleanLLMSettings(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	if err := db.Where("setting_key LIKE ?", "LLM\\_%").Delete(&models.AppSetting{}).Error; err != nil {
+		t.Errorf("cleanup pengaturan LLM gagal: %v", err)
+	}
 }
 
 func createIndexedDoc(t *testing.T, db *gorm.DB, title, category, ext, scope string, ownerTeam *string, data []byte) (models.Document, ContentIndexResult) {
@@ -122,6 +136,26 @@ func TestIntegrationRetrieval(t *testing.T) {
 	admin := models.User{Role: models.RoleSuperAdmin}
 	builtin := LLMConfig{Provider: ProviderBuiltin}
 	teamA, teamB := "team-a", "team-b"
+	for _, team := range []models.MasterTeam{
+		{ID: teamA, TeamCode: "IT_TEAM_A", TeamName: "Integration Team A"},
+		{ID: teamB, TeamCode: "IT_TEAM_B", TeamName: "Integration Team B"},
+	} {
+		if err := db.Create(&team).Error; err != nil {
+			t.Fatal(err)
+		}
+		id := team.ID
+		t.Cleanup(func() {
+			// Dokumen harus dihapus sebelum tim karena AutoMigrate membuat foreign key.
+			for _, docID := range integrationDocIDs {
+				if err := db.Model(&models.Document{}).Where("id = ? AND owner_team_id = ?", docID, id).Update("owner_team_id", nil).Error; err != nil {
+					t.Errorf("cleanup owner tim uji: %v", err)
+				}
+			}
+			if err := db.Where("id = ?", id).Delete(&models.MasterTeam{}).Error; err != nil {
+				t.Errorf("cleanup tim uji: %v", err)
+			}
+		})
+	}
 
 	bast, bastIdx := createIndexedDoc(t, db, "BAST CorePay v1.1", "BAST", ".pdf", "ALL_TIM", nil, buildTestPDF([]testPDFPage{
 		{Lines: []string{"BERITA ACARA SERAH TERIMA", "Aplikasi CorePay versi 1.1 diserahterimakan kepada Tim Keuangan.", "Ditandatangani oleh Kepala Departemen TI."}},
@@ -269,95 +303,68 @@ func TestIntegrationRetrieval(t *testing.T) {
 		}
 	})
 
-	t.Run("thinking dengan agen LLM (fallback provider tanpa tools)", func(t *testing.T) {
-		decisions := 0
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			raw, _ := io.ReadAll(r.Body)
-			body := string(raw)
-			switch {
-			case strings.Contains(body, `"tools":`):
-				w.WriteHeader(http.StatusBadRequest)
-				fmt.Fprint(w, `{"error":"tools is not supported"}`)
-			case strings.Contains(body, `"stream":true`):
-				w.Header().Set("Content-Type", "text/event-stream")
-				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"BAST CorePay ditandatangani Kepala Departemen TI [1].\"}}]}\n\n")
-				fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":30}}\n\ndata: [DONE]\n\n")
-			case strings.Contains(body, "agen riset PANDA"):
-				decisions++
-				reply := `{"thought":"Perlu mencari dokumen serah terima.","action":"search","queries":["berita acara serah terima CorePay"]}`
-				if decisions > 1 {
-					reply = `{"thought":"Bukti cukup.","action":"finish","refs":["E1"]}`
-				}
-				b, _ := json.Marshal(reply)
-				fmt.Fprintf(w, `{"choices":[{"message":{"content":%s}}],"usage":{"prompt_tokens":400,"completion_tokens":40}}`, b)
-			default:
-				w.WriteHeader(http.StatusBadRequest)
+	t.Run("agent terkonfigurasi tidak digantikan builtin", func(t *testing.T) {
+		for _, thinking := range []bool{false, true} {
+			for _, prompt := range []string{"halo", "tadi saya tanya apa?", "cari BAST CorePay"} {
+				t.Run(fmt.Sprintf("thinking=%t/%s", thinking, prompt), func(t *testing.T) {
+					calls := 0
+					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						calls++
+						var body map[string]any
+						if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["tools"] == nil {
+							t.Error("model harus menerima native tools, bukan JSON planner")
+						}
+						w.WriteHeader(http.StatusBadRequest)
+						fmt.Fprint(w, `{"error":"tools is not supported"}`)
+					}))
+					defer srv.Close()
+					key := "fake-key"
+					if err := SaveLLMConfig(db, LLMConfigUpdate{Provider: "custom", BaseURL: srv.URL, Model: "fake-model", APIKey: &key}, "IT001"); err != nil {
+						t.Fatal(err)
+					}
+					defer cleanLLMSettings(t, db)
+					resp, err := AnswerAgenticQuery(context.Background(), db, admin, AIChatRequest{Prompt: prompt, Thinking: thinking}, "", nil)
+					if resp != nil || err == nil || calls != 1 {
+						t.Fatalf("harus mengembalikan error model tanpa jalur pengganti: resp=%+v err=%v calls=%d", resp, err, calls)
+					}
+				})
 			}
-		}))
-		defer srv.Close()
-		key, share, steps := "fake-key", true, 4
-		if err := SaveLLMConfig(db, LLMConfigUpdate{Provider: "custom", BaseURL: srv.URL, Model: "fake-model", APIKey: &key,
-			ShareDocContent: &share, ThinkingMaxSteps: &steps}, "IT001"); err != nil {
-			t.Fatal(err)
-		}
-		defer db.Where("setting_key LIKE ?", "LLM_%").Delete(&models.AppSetting{})
-
-		var deltas strings.Builder
-		resp, err := AnswerAgenticQuery(context.Background(), db, admin, AIChatRequest{Prompt: "siapa yang menandatangani serah terima CorePay?", Thinking: true}, "",
-			func(event string, data any) {
-				if event == "answer_delta" {
-					deltas.WriteString(data.(map[string]string)["text"])
-				}
-			})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if decisions != 2 || resp.EngineMode != "PANDA Thinking · fake-model" || !strings.Contains(deltas.String(), "Kepala Departemen") {
-			t.Fatalf("alur agen LLM salah: decisions=%d engine=%q answer=%q", decisions, resp.EngineMode, deltas.String())
-		}
-		if u := resp.Trace.Usage; u.Calls != 3 || u.TotalTokens != 2*440+930 {
-			t.Fatalf("token harus dijumlahkan dari semua panggilan: %+v", u)
-		}
-		if len(resp.MatchedDocuments) == 0 || resp.MatchedDocuments[0].ID != bast.ID {
-			t.Fatalf("bukti pilihan agen harus teratas: %v", resp.MatchedDocuments)
 		}
 	})
 
-	t.Run("thinking otomatis berhenti saat jenuh", func(t *testing.T) {
+	t.Run("thinking otomatis berhenti pada batas keras", func(t *testing.T) {
 		decisions := 0
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			raw, _ := io.ReadAll(r.Body)
-			if strings.Contains(string(raw), `"tools":`) {
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
 				w.WriteHeader(http.StatusBadRequest)
-				fmt.Fprint(w, `{"error":"tools is not supported"}`)
 				return
 			}
-			if strings.Contains(string(raw), `"stream":true`) {
-				w.Header().Set("Content-Type", "text/event-stream")
-				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Jawaban.\"}}]}\n\ndata: [DONE]\n\n")
+			if body["tool_choice"] == "none" {
+				sseContent(w, "Jawaban dari bukti yang sudah ada.")
 				return
 			}
 			decisions++
-			// Agen "bandel" yang terus mencari hal yang sama: harus dihentikan rem jenuh, bukan plafon 40 langkah
-			fmt.Fprint(w, `{"choices":[{"message":{"content":"{\"thought\":\"cari lagi\",\"action\":\"search\",\"queries\":[\"kapan serah terima CorePay\"]}"}}]}`)
+			sseToolCall(w, "", fmt.Sprintf("call_%d", decisions), "get_repository_stats", `{}`)
 		}))
 		defer srv.Close()
 		key, auto := "fake-key", ThinkingStepsAuto
 		if err := SaveLLMConfig(db, LLMConfigUpdate{Provider: "custom", BaseURL: srv.URL, Model: "fake-model", APIKey: &key, ThinkingMaxSteps: &auto}, "IT001"); err != nil {
 			t.Fatal(err)
 		}
-		defer db.Where("setting_key LIKE ?", "LLM_%").Delete(&models.AppSetting{})
+		defer cleanLLMSettings(t, db)
 
 		resp, err := AnswerAgenticQuery(context.Background(), db, admin, AIChatRequest{Prompt: "kapan serah terima CorePay?", Thinking: true}, "", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		stoppedBySaturation := false
+		stoppedByLimit := false
 		for _, s := range resp.Trace.Steps {
-			stoppedBySaturation = stoppedBySaturation || s.Title == "Penelusuran sudah jenuh"
+			stoppedByLimit = stoppedByLimit || (s.Title == "Penelusuran dihentikan" && strings.Contains(s.Detail, "Batas"))
 		}
-		if !stoppedBySaturation || decisions > agentStallLimit+1 {
-			t.Fatalf("agen yang berputar harus dihentikan setelah %d langkah tanpa temuan baru: decisions=%d", agentStallLimit, decisions)
+		if !stoppedByLimit || decisions != toolAgentThinkingCalls || resp.ReplyMarkdown != "Jawaban dari bukti yang sudah ada." {
+			t.Fatalf("agen yang berputar harus dihentikan pada batas %d tool call: decisions=%d", toolAgentThinkingCalls, decisions)
 		}
 	})
 
@@ -389,7 +396,7 @@ func TestIntegrationRetrieval(t *testing.T) {
 		if err := SaveLLMConfig(db, LLMConfigUpdate{Provider: "custom", BaseURL: srv.URL, Model: "tool-model", APIKey: &key, ShareDocContent: &share}, "IT001"); err != nil {
 			t.Fatal(err)
 		}
-		defer db.Where("setting_key LIKE ?", "LLM_%").Delete(&models.AppSetting{})
+		defer cleanLLMSettings(t, db)
 
 		pegawaiB := models.User{Role: models.RolePegawaiTI, TeamID: &teamB}
 		resp, err := AnswerAgenticQuery(context.Background(), db, pegawaiB, AIChatRequest{Prompt: "rencana migrasi gudang data rahasia"}, "", nil)
@@ -426,6 +433,45 @@ func TestIntegrationRetrieval(t *testing.T) {
 		}
 		if tool == nil || tool.Tool.Name != "search_documents" || tool.Rerank == nil || tool.Rerank.Method != "heuristic" || len(tool.Results) == 0 {
 			t.Fatalf("log langkah tool tidak lengkap: %+v", tool)
+		}
+	})
+
+	t.Run("app code filter ignores case", func(t *testing.T) {
+		tx := db.Begin()
+		if tx.Error != nil {
+			t.Fatal(tx.Error)
+		}
+		defer tx.Rollback()
+		folder := models.AppFolder{ID: uuid.NewString(), FolderName: "Case filter", AssignedTeamID: teamA}
+		if err := tx.Create(&folder).Error; err != nil {
+			t.Fatal(err)
+		}
+		app := models.Application{ID: uuid.NewString(), FolderID: folder.ID, AppCode: "MiXeD_" + uuid.NewString(), AppName: "Unrelated title"}
+		if err := tx.Create(&app).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Model(&models.Document{}).Where("id = ?", sop.ID).Update("application_id", app.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		a, err := newAgentRun(tx, admin, AIChatRequest{}, builtin, newTracer(false, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		filter := docFilter{AppCode: strings.ToLower(app.AppCode)}
+		var got []models.Document
+		if err := tx.Where("id IN (?)", a.filteredScope(filter)()).Find(&got).Error; err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].ID != sop.ID {
+			t.Fatalf("lowercase app code must match mixed-case code: %+v", got)
+		}
+	})
+
+	t.Run("canceled retrieval does not become not found", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := RetrieveContext(db.WithContext(ctx), admin, AIChatRequest{Prompt: "CorePay"}, nil, builtin); !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected canceled retrieval, got %v", err)
 		}
 	})
 

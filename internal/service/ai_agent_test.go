@@ -7,33 +7,14 @@ import (
 	"panda-backend/internal/models"
 )
 
-// ─── Satu saklar isi dokumen (R1) ────────────────────────────────────────────
-
-func TestChatContextExcludesChunksWhenSharingDisabled(t *testing.T) {
-	docs := []AIDocumentCitation{{ID: "d1", Title: "UAT CorePay", AISummary: "Ringkasan UAT CorePay v1.1"}}
-	chunks := map[string][]chunkHit{"d1": {{ChunkIndex: 0, Text: "RAHASIA-ISI-CHUNK-777"}}}
-
-	ctx := buildChatContext(docs, chunks, false)
-	if strings.Contains(ctx, "RAHASIA-ISI-CHUNK-777") || strings.Contains(ctx, "Kutipan isi dokumen") {
-		t.Fatalf("isi dokumen ikut dikirim ke LLM padahal saklar mati:\n%s", ctx)
+func TestToolPromptRespectsContentPolicy(t *testing.T) {
+	a := newTestToolAgent(LLMConfig{ShareDocContent: false}, "x", false, nil)
+	if !strings.Contains(a.toolSystemPrompt(false, false), "Isi file tidak dibagikan") {
+		t.Fatal("model harus diberi tahu bahwa isi file tidak dibagikan")
 	}
-	if !strings.Contains(ctx, "Ringkasan UAT CorePay v1.1") || !strings.Contains(ctx, "UAT CorePay") {
-		t.Fatalf("metadata & ringkasan tetap harus dikirim:\n%s", ctx)
-	}
-	if !strings.Contains(chatSystemPrompt("Semua Tim", false, false, false), "isi file tidak disertakan") {
-		t.Fatalf("system prompt harus menjelaskan bahwa isi file tidak disertakan")
-	}
-}
-
-func TestChatContextIncludesChunksWhenSharingEnabled(t *testing.T) {
-	docs := []AIDocumentCitation{{ID: "d1", Title: "UAT CorePay"}}
-	chunks := map[string][]chunkHit{"d1": {{ChunkIndex: 2, Text: "RAHASIA-ISI-CHUNK-777"}}}
-	ctx := buildChatContext(docs, chunks, true)
-	if !strings.Contains(ctx, "RAHASIA-ISI-CHUNK-777") || !strings.Contains(ctx, "bagian ke-3") {
-		t.Fatalf("kutipan isi harus disertakan saat saklar nyala:\n%s", ctx)
-	}
-	if strings.Contains(chatSystemPrompt("Semua Tim", true, false, false), "isi file tidak disertakan") {
-		t.Fatalf("system prompt saat saklar nyala tidak boleh menyebut isi file disembunyikan")
+	a.cfg.ShareDocContent = true
+	if strings.Contains(a.toolSystemPrompt(false, false), "Isi file tidak dibagikan") {
+		t.Fatal("kebijakan isi tersembunyi tidak boleh dipasang saat sharing aktif")
 	}
 }
 
@@ -133,10 +114,11 @@ func TestIsConversationQuestion(t *testing.T) {
 }
 
 func TestHistoryMessagesRespectDocContentSwitch(t *testing.T) {
+	contentUsed, metadataOnly := true, false
 	history := []ChatTurn{
 		{Prompt: "Apa hasil UAT CorePay?", Reply: "> RAHASIA-KUTIPAN-ISI\nHasil UAT lulus.", EngineMode: "Built-in Go Smart Document Agent (Zero API Key)",
-			DocTitles: []string{"UAT CorePay (v1.1)"}},
-		{Prompt: "apa nama dokumennya", Reply: "Nama dokumennya UAT CorePay [1].", EngineMode: "External LLM RAG (gemini) · isi dokumen tidak dikirim"},
+			DocTitles: []string{"UAT CorePay (v1.1)"}, DocContentUsed: &contentUsed},
+		{Prompt: "apa nama dokumennya", Reply: "Nama dokumennya UAT CorePay [1].", EngineMode: "External LLM RAG (gemini) · isi dokumen tidak dikirim", DocContentUsed: &metadataOnly},
 	}
 
 	off := historyMessages(history, false)
@@ -154,7 +136,8 @@ func TestHistoryMessagesRespectDocContentSwitch(t *testing.T) {
 	if !strings.Contains(on[1]["content"], "RAHASIA-KUTIPAN-ISI") {
 		t.Fatalf("saat saklar nyala, jawaban lama dikirim apa adanya: %q", on[1]["content"])
 	}
-	if !strings.Contains(chatSystemPrompt("Semua Tim", true, true, false), "tadi saya tanya apa?") {
+	a := newTestToolAgent(LLMConfig{ShareDocContent: true}, "x", false, nil)
+	if !strings.Contains(a.toolSystemPrompt(false, true), "pertanyaan tentang percakapan itu sendiri") {
 		t.Fatalf("system prompt harus mengizinkan AI menjawab pertanyaan tentang percakapan")
 	}
 }

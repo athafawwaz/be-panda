@@ -2,12 +2,7 @@
 -- umum, tanpa dokumen), atau MIXED. NULL = jawaban yang tersimpan sebelum fitur ini ada.
 
 -- +goose Up
--- +goose StatementBegin
-IF COL_LENGTH('dbo.ai_chat_messages', 'answer_basis') IS NULL
-    ALTER TABLE dbo.ai_chat_messages ADD answer_basis NVARCHAR(20) NULL;
--- +goose StatementEnd
+ALTER TABLE ai_chat_messages ADD COLUMN IF NOT EXISTS answer_basis VARCHAR(20) NULL;
 
 -- +goose Down
--- +goose StatementBegin
-ALTER TABLE dbo.ai_chat_messages DROP COLUMN IF EXISTS answer_basis;
--- +goose StatementEnd
+ALTER TABLE ai_chat_messages DROP COLUMN IF EXISTS answer_basis;

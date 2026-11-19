@@ -2,116 +2,34 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
+	"github.com/gofiber/fiber/v3"
 	"gorm.io/gorm"
 
 	"panda-backend/internal/models"
 	"panda-backend/internal/service"
 )
 
-const (
-	chatTitleMaxRunes    = 80
-	chatSessionListLimit = 100
-)
-
-// chatTitle membuat judul percakapan dari pertanyaan pertama.
-func chatTitle(prompt string) string {
-	title := []rune(strings.Join(strings.Fields(prompt), " "))
-	if len(title) > chatTitleMaxRunes {
-		return string(title[:chatTitleMaxRunes]) + "…"
-	}
-	return string(title)
-}
-
-// replyExcerptRunes: panjang cuplikan pesan yang dibalas/diteruskan yang disimpan untuk ditampilkan di riwayat.
-const replyExcerptRunes = 300
-
-// saveChatTurn menyimpan satu tanya-jawab Agentic AI (beserta langkah AI & pesan yang dibalas) ke riwayat chat
-// milik owner. Sesi baru dibuat bila sessionID kosong atau bukan milik owner; id sesi & id pesan dikembalikan.
-func (h *Handler) saveChatTurn(owner models.User, sessionID string, req service.AIChatRequest, resp *service.AIChatResponse) (string, int64, error) {
-	now := time.Now().UTC()
-	docsJSON, err := json.Marshal(resp.MatchedDocuments)
-	if err != nil {
-		return "", 0, err
-	}
-	traceJSON := ""
-	if resp.Trace != nil {
-		if b, err := json.Marshal(resp.Trace); err == nil {
-			traceJSON = string(b)
-		}
-	}
-	replyJSON := ""
-	if req.ReplyTo != nil {
-		ref := *req.ReplyTo
-		if r := []rune(strings.TrimSpace(ref.Text)); len(r) > replyExcerptRunes {
-			ref.Text = string(r[:replyExcerptRunes]) + "…"
-		}
-		if b, err := json.Marshal(ref); err == nil {
-			replyJSON = string(b)
-		}
-	}
-	var messageID int64
-
-	err = h.DB.Transaction(func(tx *gorm.DB) error {
-		var session models.AIChatSession
-		if sessionID == "" || tx.First(&session, "id = ? AND user_id = ?", sessionID, owner.ID).Error != nil {
-			session = models.AIChatSession{
-				ID:        uuid.NewString(),
-				UserID:    owner.ID,
-				Title:     chatTitle(req.Prompt),
-				CreatedAt: now,
-				UpdatedAt: now,
-			}
-			if err := tx.Create(&session).Error; err != nil {
-				return err
-			}
-		}
-		sessionID = session.ID
-
-		msg := models.AIChatMessage{
-			SessionID:            session.ID,
-			Prompt:               req.Prompt,
-			FilterModule:         req.FilterModule,
-			ReplyMarkdown:        resp.ReplyMarkdown,
-			EngineMode:           resp.EngineMode,
-			ScopeLabel:           resp.ScopeLabel,
-			MatchedDocumentsJSON: string(docsJSON),
-			TraceJSON:            traceJSON,
-			ReplyToJSON:          replyJSON,
-			AnswerBasis:          resp.AnswerBasis,
-			CreatedAt:            now,
-		}
-		if err := tx.Create(&msg).Error; err != nil {
-			return err
-		}
-		messageID = msg.ID
-		return tx.Model(&models.AIChatSession{}).Where("id = ?", session.ID).Updates(map[string]interface{}{
-			"updated_at":    now,
-			"message_count": gorm.Expr("message_count + 1"),
-		}).Error
-	})
-	return sessionID, messageID, err
-}
+const chatSessionListLimit = 100
 
 // GetChatSessions menampilkan daftar percakapan Agentic AI milik user yang login, terbaru di atas.
-func (h *Handler) GetChatSessions(c *gin.Context) {
+func (h *Handler) GetChatSessions(c fiber.Ctx) error {
 	owner, _ := getRealUser(c)
 	var sessions []models.AIChatSession
-	if err := h.DB.Where("user_id = ?", owner.ID).
+	if err := h.DB.WithContext(c.Context()).Where("user_id = ?", owner.ID).
 		Order("updated_at DESC").
 		Limit(chatSessionListLimit).
 		Find(&sessions).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat riwayat chat"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal memuat riwayat chat"})
+
 	}
-	c.JSON(http.StatusOK, gin.H{"sessions": sessions})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"sessions": sessions})
 }
 
 type chatTurn struct {
@@ -123,16 +41,23 @@ type chatTurn struct {
 }
 
 // GetChatSession membuka kembali satu percakapan beserta seluruh tanya-jawab dan dokumen yang dikutip.
-func (h *Handler) GetChatSession(c *gin.Context) {
+func (h *Handler) GetChatSession(c fiber.Ctx) error {
 	owner, _ := getRealUser(c)
 	var session models.AIChatSession
-	if err := h.DB.First(&session, "id = ? AND user_id = ?", c.Param("id"), owner.ID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Riwayat chat tidak ditemukan"})
-		return
+	if err := h.DB.WithContext(c.Context()).First(&session, "id = ? AND user_id = ?", c.Params("id"), owner.ID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Riwayat chat tidak ditemukan"})
+		} else {
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal memuat riwayat chat"})
+		}
+
 	}
 
 	var messages []models.AIChatMessage
-	h.DB.Where("session_id = ?", session.ID).Order("id ASC").Find(&messages)
+	if err := h.DB.WithContext(c.Context()).Where("session_id = ?", session.ID).Order("id ASC").Find(&messages).Error; err != nil {
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal memuat riwayat chat"})
+
+	}
 
 	turns := make([]chatTurn, 0, len(messages))
 	for _, m := range messages {
@@ -170,16 +95,16 @@ func (h *Handler) GetChatSession(c *gin.Context) {
 			CreatedAt: m.CreatedAt,
 		})
 	}
-	c.JSON(http.StatusOK, gin.H{"session": session, "messages": turns})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"session": session, "messages": turns})
 }
 
 // DeleteChatSession menghapus satu percakapan milik user beserta seluruh isinya.
-func (h *Handler) DeleteChatSession(c *gin.Context) {
+func (h *Handler) DeleteChatSession(c fiber.Ctx) error {
 	owner, _ := getRealUser(c)
-	sessionID := c.Param("id")
+	sessionID := c.Params("id")
 
 	found := false
-	err := h.DB.Transaction(func(tx *gorm.DB) error {
+	err := h.DB.WithContext(c.Context()).Transaction(func(tx *gorm.DB) error {
 		res := tx.Where("id = ? AND user_id = ?", sessionID, owner.ID).Delete(&models.AIChatSession{})
 		if res.Error != nil {
 			return res.Error
@@ -191,14 +116,14 @@ func (h *Handler) DeleteChatSession(c *gin.Context) {
 		return tx.Where("session_id = ?", sessionID).Delete(&models.AIChatMessage{}).Error
 	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus riwayat chat"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menghapus riwayat chat"})
+
 	}
 	if !found {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Riwayat chat tidak ditemukan"})
-		return
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Riwayat chat tidak ditemukan"})
+
 	}
-	c.JSON(http.StatusOK, gin.H{"deleted": true})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"deleted": true})
 }
 
 func cleanDocShortTitle(doc models.Document) string {
@@ -345,7 +270,7 @@ func generateDynamicShortcuts(docs []models.Document, user models.User) []string
 // GetAIChatShortcuts menghasilkan daftar saran shortcut pertanyaan dinamis
 // yang disesuaikan secara cerdas berdasarkan dokumen yang boleh diakses pengguna saat ini.
 // Setiap pemanggilan / refresh menghasilkan variasi pertanyaan yang berbeda.
-func (h *Handler) GetAIChatShortcuts(c *gin.Context) {
+func (h *Handler) GetAIChatShortcuts(c fiber.Ctx) error {
 	user := getCurrentUser(c)
 
 	// Ambil dokumen yang boleh diakses user sesuai isolasi data Tim/Branch
@@ -354,22 +279,14 @@ func (h *Handler) GetAIChatShortcuts(c *gin.Context) {
 		Preload("OwnerTeam").
 		Preload("OwnerBranch")
 
-	if !user.IsAdmin() {
-		if user.TeamID != nil && user.BranchID != nil {
-			query = query.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ? AND (owner_branch_id IS NULL OR owner_branch_id = '' OR owner_branch_id = ?))", *user.TeamID, *user.BranchID)
-		} else if user.TeamID != nil {
-			query = query.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ?)", *user.TeamID)
-		} else {
-			query = query.Where("visibility_scope = 'ALL_TIM'")
-		}
-	}
+	query = service.ApplyDocumentScope(query, user)
 
 	var docs []models.Document
 	if err := query.Order("uploaded_at DESC").Limit(50).Find(&docs).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membaca dokumen"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal membaca dokumen"})
+
 	}
 
 	shortcuts := generateDynamicShortcuts(docs, user)
-	c.JSON(http.StatusOK, gin.H{"shortcuts": shortcuts})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"shortcuts": shortcuts})
 }

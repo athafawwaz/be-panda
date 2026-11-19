@@ -319,3 +319,26 @@ func TestInitReportsUnreachableMinIO(t *testing.T) {
 		t.Fatalf("MinIO yang tidak bisa dihubungi harus dilaporkan tanpa diam-diam pindah ke lokal: driver=%s err=%v", Driver(), err)
 	}
 }
+
+func TestStorageRejectsTraversalBeforeAccess(t *testing.T) {
+	resetStore(t)
+	root := filepath.Join(t.TempDir(), "uploads")
+	if err := Init(Config{LocalRoot: root}); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(filepath.Dir(root), "outside.pdf")
+	if err := os.WriteFile(outside, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"../outside.pdf", "APP_SOP_x/../../outside.pdf", `..\outside.pdf`, outside} {
+		if _, err := Save(context.Background(), key, []byte("overwrite")); err == nil {
+			t.Errorf("Save accepted traversal %q", key)
+		}
+		if _, err := Exists(context.Background(), key); err == nil {
+			t.Errorf("Exists accepted traversal %q", key)
+		}
+	}
+	if data, err := os.ReadFile(outside); err != nil || string(data) != "keep" {
+		t.Fatalf("outside file changed: %q, %v", data, err)
+	}
+}

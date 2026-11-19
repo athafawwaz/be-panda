@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -58,7 +57,7 @@ type agentTool struct {
 }
 
 func fnDef(name, desc string, props map[string]any, required ...string) toolDef {
-	params := map[string]any{"type": "object", "properties": props}
+	params := map[string]any{"type": "object", "properties": props, "additionalProperties": false}
 	if len(required) > 0 {
 		params["required"] = required
 	}
@@ -160,35 +159,93 @@ func toolNames() []string {
 
 // ─── Argumen ─────────────────────────────────────────────────────────────────
 
-func argString(args map[string]any, key string) string {
-	switch v := args[key].(type) {
-	case string:
-		return strings.TrimSpace(v)
-	case float64:
-		return strconv.FormatFloat(v, 'f', -1, 64)
-	case []any:
-		parts := make([]string, 0, len(v))
-		for _, p := range v {
-			if s, ok := p.(string); ok && strings.TrimSpace(s) != "" {
-				parts = append(parts, strings.TrimSpace(s))
-			}
+// validateToolArgs enforces the same contract advertised to the model.
+func validateToolArgs(tool *agentTool, args map[string]any) string {
+	if tool == nil {
+		return "tool tidak dikenal"
+	}
+	params := tool.Def.Function.Parameters
+	props, ok := params["properties"].(map[string]any)
+	if !ok {
+		return "kontrak argumen tool tidak valid"
+	}
+	required, _ := params["required"].([]string)
+	for _, key := range required {
+		value, exists := args[key]
+		if !exists {
+			return fmt.Sprintf("%s wajib diisi", key)
 		}
-		return strings.Join(parts, ",")
+		if s, ok := value.(string); ok && strings.TrimSpace(s) == "" {
+			return fmt.Sprintf("%s wajib diisi", key)
+		}
+	}
+	for key, value := range args {
+		raw, exists := props[key]
+		if !exists {
+			return "argumen tidak dikenal; gunakan hanya parameter tool yang dideklarasikan"
+		}
+		prop, ok := raw.(map[string]any)
+		if !ok {
+			return "kontrak argumen tool tidak valid"
+		}
+		switch prop["type"] {
+		case "string":
+			s, ok := value.(string)
+			if !ok {
+				return fmt.Sprintf("%s harus string", key)
+			}
+			if enum, ok := prop["enum"].([]string); ok {
+				s = strings.TrimSpace(s)
+				valid := false
+				for _, choice := range enum {
+					if s == choice || (inList(key, []string{"category", "module", "sort", "group_by"}) && strings.EqualFold(s, choice)) {
+						valid = true
+						break
+					}
+				}
+				if !valid {
+					return fmt.Sprintf("%s tidak dikenal; pilihan: %s", key, strings.Join(enum, ", "))
+				}
+			}
+		case "integer":
+			var n float64
+			switch v := value.(type) {
+			case float64:
+				n = v
+			case int:
+				n = float64(v)
+			default:
+				return fmt.Sprintf("%s harus integer", key)
+			}
+			lo, lok := prop["minimum"].(int)
+			hi, hik := prop["maximum"].(int)
+			if !lok || !hik || math.IsNaN(n) || math.IsInf(n, 0) || math.Trunc(n) != n || n < float64(lo) || n > float64(hi) {
+				return fmt.Sprintf("%s harus integer antara %d dan %d", key, lo, hi)
+			}
+		default:
+			return "kontrak argumen tool tidak valid"
+		}
 	}
 	return ""
 }
 
+func argString(args map[string]any, key string) string {
+	v, _ := args[key].(string)
+	return strings.TrimSpace(v)
+}
+
 func argInt(args map[string]any, key string, def, lo, hi int) int {
-	n := def
 	switch v := args[key].(type) {
+	case int:
+		if v >= lo && v <= hi {
+			return v
+		}
 	case float64:
-		n = int(v)
-	case string:
-		if p, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
-			n = p
+		if v >= float64(lo) && v <= float64(hi) && math.Trunc(v) == v {
+			return int(v)
 		}
 	}
-	return max(lo, min(n, hi))
+	return def
 }
 
 func inList(v string, list []string) bool {
@@ -236,20 +293,37 @@ func (f docFilter) asMap() map[string]string {
 
 // ─── Hasil JSON ──────────────────────────────────────────────────────────────
 
+const toolJSONFitError = "Hasil tool terlalu besar untuk batas keluaran; persempit permintaan."
+
 func errorResult(msg string) toolResult {
-	b, _ := json.Marshal(map[string]string{"error": msg})
-	return toolResult{Output: string(b), Err: msg, Summary: msg}
+	truncated := msg == toolJSONFitError
+	b, _ := json.Marshal(map[string]any{"error": msg, "returned": 0, "truncated": truncated})
+	if len(b) > toolResultMaxChars {
+		return errorResult(toolJSONFitError)
+	}
+	return toolResult{Output: string(b), Err: msg, Summary: msg, Truncated: truncated}
 }
 
-// fitJSON menyusun JSON dengan n item, dikurangi sampai muat toolResultMaxChars. truncated = ada item yang dibuang.
-func fitJSON(build func(n int) any, n int) (out string, shown int, truncated bool) {
-	for k := n; k >= 0; k-- {
-		b, _ := json.Marshal(build(k))
-		if len(b) <= toolResultMaxChars || k == 0 {
-			return string(b), k, k < n
+// fitJSON limits serialized bytes, including metadata when no items remain.
+func fitJSON(build func(n int) any, n int) (out string, shown int, truncated bool, errMsg string) {
+	for k := max(0, n); k >= 0; k-- {
+		payload := build(k)
+		cut := k < n
+		if m, ok := payload.(map[string]any); ok {
+			alreadyCut, _ := m["truncated"].(bool)
+			cut = cut || alreadyCut
+			m["truncated"] = cut
+			if _, exists := m["returned"]; !exists {
+				m["returned"] = k
+			}
+		}
+		b, err := json.Marshal(payload)
+		if err == nil && len(b) <= toolResultMaxChars {
+			return string(b), k, cut, ""
 		}
 	}
-	return "{}", 0, n > 0
+	res := errorResult(toolJSONFitError)
+	return res.Output, 0, true, res.Err
 }
 
 func appLabel(d *models.Document) string {
@@ -304,16 +378,8 @@ func runSearchDocumentsTool(ctx context.Context, a *agentRun, args map[string]an
 	if ferr != "" {
 		return errorResult(ferr)
 	}
-	if query == "" && f.empty() {
+	if query == "" {
 		return errorResult("query wajib diisi")
-	}
-	// app_code yang tidak cocok dengan aplikasi mana pun dalam cakupan (mis. nama dokumen Evidence) dipakai sebagai
-	// kata kunci, bukan filter, agar pencarian tidak kosong karena salah tebak filter
-	appNote := ""
-	if f.AppCode != "" && !a.anyDocMatches(docFilter{AppCode: f.AppCode}) {
-		appNote = fmt.Sprintf("app_code %q tidak cocok dengan aplikasi mana pun dalam cakupan user; dipakai sebagai kata kunci.", f.AppCode)
-		query = strings.TrimSpace(query + " " + f.AppCode)
-		f.AppCode = ""
 	}
 	topK := argInt(args, "top_k", a.rerankCfg.TopN, 1, MaxRerankTopN)
 	candidates := a.rerankCfg.Candidates
@@ -324,7 +390,15 @@ func runSearchDocumentsTool(ctx context.Context, a *agentRun, args map[string]an
 	st.Tool.Phase = fmt.Sprintf("Mengambil hingga %d kandidat dari indeks kata & metadata…", candidates)
 	a.tr.update(st)
 
-	cands, fresh := a.searchFiltered(query, f, candidates)
+	var cands []*evidence
+	fresh := 0
+	if f.AppCode == "" || a.anyDocMatches(docFilter{AppCode: f.AppCode}) {
+		var err error
+		cands, fresh, err = a.searchFiltered(query, f, candidates)
+		if err != nil {
+			return errorResult("Pencarian dokumen gagal; coba lagi.")
+		}
+	}
 	ranked, scores, info := a.rerankCandidates(ctx, query, cands, topK, st)
 
 	build := func(n int) any {
@@ -342,7 +416,7 @@ func runSearchDocumentsTool(ctx context.Context, a *agentRun, args map[string]an
 			}
 			items = append(items, it)
 		}
-		payload := map[string]any{"query": query, "results": items, "total_candidates": len(cands)}
+		payload := map[string]any{"query": query, "results": items, "total_candidates": len(cands), "truncated": n < len(cands)}
 		if fm := f.asMap(); len(fm) > 0 {
 			payload["filters"] = fm
 		}
@@ -352,15 +426,15 @@ func runSearchDocumentsTool(ctx context.Context, a *agentRun, args map[string]an
 		if len(items) == 0 {
 			payload["note"] = "Tidak ada dokumen dalam cakupan akses user yang cocok. Coba kueri lain (sinonim/singkatan), longgarkan filter, atau pakai list_documents."
 		}
-		if appNote != "" {
-			payload["filter_note"] = appNote
-		}
 		if !a.cfg.ShareDocContent {
 			payload["content_policy"] = "Isi file tidak dibagikan ke AI eksternal; hanya metadata & ringkasan pengunggah."
 		}
 		return payload
 	}
-	out, shown, truncated := fitJSON(build, len(ranked))
+	out, shown, truncated, fitErr := fitJSON(build, len(ranked))
+	if fitErr != "" {
+		return errorResult(fitErr)
+	}
 
 	res := toolResult{Output: out, Count: shown, Fresh: fresh, Truncated: truncated, Rerank: info, Queries: st.Queries}
 	focus := contentSearchTerms(query, a.known)
@@ -386,9 +460,6 @@ func runSearchDocumentsTool(ctx context.Context, a *agentRun, args map[string]an
 	}
 	if info.Fallback != "" {
 		res.Summary += " Reranker model tidak dipakai: " + info.Fallback + "."
-	}
-	if appNote != "" {
-		res.Summary += " " + appNote
 	}
 	return res
 }
@@ -497,8 +568,9 @@ func describeRerankFailure(err error) string {
 // ─── read_document ───────────────────────────────────────────────────────────
 
 type readSection struct {
-	Section int    `json:"section"`
-	Text    string `json:"text"`
+	Section   int    `json:"section"`
+	Text      string `json:"text"`
+	Truncated bool   `json:"truncated"`
 }
 
 type readDoc struct {
@@ -532,7 +604,7 @@ func runReadDocumentTool(ctx context.Context, a *agentRun, args map[string]any, 
 		return errorResult("ref wajib diisi, mis. E2 atau D1")
 	}
 	if len(refs) > agentMaxReads {
-		refs = refs[:agentMaxReads]
+		return errorResult(fmt.Sprintf("Maksimal %d ref per read_document; pisahkan panggilan.", agentMaxReads))
 	}
 	st.Tool.Phase = "Memuat bagian dokumen beserta bagian sebelum & sesudahnya…"
 	a.tr.update(st)
@@ -545,14 +617,22 @@ func runReadDocumentTool(ctx context.Context, a *agentRun, args map[string]any, 
 		switch {
 		case a.byRef[ref] != nil:
 			ev := a.byRef[ref]
-			if a.loadNeighbors(ev) {
+			fresh, err := a.loadNeighbors(ev)
+			if err != nil {
+				return errorResult("Pembacaan dokumen gagal; coba lagi.")
+			}
+			if fresh {
 				res.Fresh++
 			}
 			evs, doc = []*evidence{ev}, ev.Doc
 		case a.byDRef[ref] != nil:
 			doc = a.byDRef[ref]
 			first := !a.readDocs[doc.ID]
-			for _, h := range loadLeadingChunks(a.db, []string{doc.ID})[doc.ID] {
+			leading, err := loadLeadingChunks(a.db, []string{doc.ID})
+			if err != nil {
+				return errorResult("Pembacaan dokumen gagal; coba lagi.")
+			}
+			for _, h := range leading[doc.ID] {
 				if ev, _ := a.addEvidence(h, true); ev != nil {
 					evs = append(evs, ev)
 				}
@@ -577,7 +657,8 @@ func runReadDocumentTool(ctx context.Context, a *agentRun, args map[string]any, 
 			for _, c := range chunks {
 				if !seen[c.ChunkIndex] {
 					seen[c.ChunkIndex] = true
-					rd.Sections = append(rd.Sections, readSection{Section: c.ChunkIndex + 1, Text: clip(oneLine(c.Text), toolReadSectionRunes)})
+					text := oneLine(c.Text)
+					rd.Sections = append(rd.Sections, readSection{Section: c.ChunkIndex + 1, Text: clip(text, toolReadSectionRunes), Truncated: len([]rune(text)) > toolReadSectionRunes})
 				}
 			}
 		} else {
@@ -587,16 +668,21 @@ func runReadDocumentTool(ctx context.Context, a *agentRun, args map[string]any, 
 		res.Results = append(res.Results, StepResult{Ref: ref, DocumentID: doc.ID, Title: doc.Title, Category: doc.DocCategory,
 			Version: doc.VersionLabel, Section: firstSection(evs), Selected: true})
 	}
-	// Bila terlalu panjang, jumlah bagian per dokumen dipangkas (bukan dokumennya) agar model tetap tahu semua ref
+	// Keep requested refs visible; shrink sections down to zero before failing explicitly.
 	build := func(n int) any {
 		trimmed := make([]readDoc, len(docs))
 		copy(trimmed, docs)
+		cut := false
 		for i := range trimmed {
-			if len(trimmed[i].Sections) > max(1, n) {
-				trimmed[i].Sections = trimmed[i].Sections[:max(1, n)]
+			if len(trimmed[i].Sections) > n {
+				trimmed[i].Sections = trimmed[i].Sections[:n]
+				cut = true
+			}
+			for _, section := range trimmed[i].Sections {
+				cut = cut || section.Truncated
 			}
 		}
-		payload := map[string]any{"documents": trimmed}
+		payload := map[string]any{"documents": trimmed, "returned": len(docs), "total_matching": len(refs), "truncated": cut}
 		if !a.cfg.ShareDocContent {
 			payload["content_policy"] = "Isi file tidak dibagikan ke AI eksternal; sarankan user membuka dokumen lewat tombol Lihat untuk rinciannya."
 		}
@@ -606,7 +692,10 @@ func runReadDocumentTool(ctx context.Context, a *agentRun, args map[string]any, 
 	for _, d := range docs {
 		maxSections = max(maxSections, len(d.Sections))
 	}
-	out, _, truncated := fitJSON(build, maxSections)
+	out, _, truncated, fitErr := fitJSON(build, maxSections)
+	if fitErr != "" {
+		return errorResult(fitErr)
+	}
 	res.Output, res.Truncated, res.Count = out, truncated, len(res.Results)
 	res.Summary = fmt.Sprintf("Membaca %d ref (%d dokumen dibaca sepanjang jawaban ini).", len(refs), len(a.readDocs))
 	if len(res.Results) == 0 {
@@ -677,6 +766,7 @@ func runListDocumentsTool(ctx context.Context, a *agentRun, args map[string]any,
 		sort.SliceStable(matched, func(i, j int) bool { return strings.ToLower(matched[i].Title) < strings.ToLower(matched[j].Title) })
 	default: // a.docs sudah urut terbaru
 	}
+	total := len(matched)
 	if len(matched) > limit {
 		matched = matched[:limit]
 	}
@@ -687,14 +777,8 @@ func runListDocumentsTool(ctx context.Context, a *agentRun, args map[string]any,
 			UploadedAt: d.UploadedAt.In(wib).Format("2006-01-02 15:04") + " WIB", ValidUntil: d.ValidUntil,
 			Summary: clip(oneLine(d.AISummary), toolSummaryRunes)}
 	}
-	total := 0
-	for i := range a.docs {
-		if f.matches(&a.docs[i]) {
-			total++
-		}
-	}
 	build := func(n int) any {
-		payload := map[string]any{"total_in_scope_matching_filters": total, "items": items[:n]}
+		payload := map[string]any{"total_in_scope_matching_filters": total, "total_matching": total, "items": items[:n], "truncated": n < total}
 		if fm := f.asMap(); len(fm) > 0 {
 			payload["filters"] = fm
 		}
@@ -703,7 +787,10 @@ func runListDocumentsTool(ctx context.Context, a *agentRun, args map[string]any,
 		}
 		return payload
 	}
-	out, shown, truncated := fitJSON(build, len(items))
+	out, shown, truncated, fitErr := fitJSON(build, len(items))
+	if fitErr != "" {
+		return errorResult(fitErr)
+	}
 	res := toolResult{Output: out, Count: shown, Truncated: truncated, Fresh: shown}
 	for _, it := range items[:shown] {
 		d := a.byDRef[it.Ref]
@@ -728,13 +815,13 @@ type appVersion struct {
 
 // scopedApplications mencari aplikasi dalam folder yang boleh diakses user (aturan menu Aplikasi). Tanpa database
 // (unit test), aplikasi diambil dari dokumen dalam cakupan.
-func (a *agentRun) scopedApplications(key string, limit int) []models.Application {
+func (a *agentRun) scopedApplications(key string, limit int) ([]models.Application, error) {
 	if a.db == nil {
 		seen := map[string]bool{}
 		var out []models.Application
 		for i := range a.docs {
 			app := a.docs[i].Application
-			if app != nil && !seen[app.ID] && (key == "" || appMatches(app, key)) && len(out) < limit {
+			if app != nil && !seen[app.ID] && (key == "" || appMatches(app, key)) && (limit <= 0 || len(out) < limit) {
 				seen[app.ID] = true
 				cp := *app
 				if a.docs[i].Folder != nil {
@@ -743,28 +830,31 @@ func (a *agentRun) scopedApplications(key string, limit int) []models.Applicatio
 				out = append(out, cp)
 			}
 		}
-		return out
+		return out, nil
 	}
 	q := a.db.Preload("Folder.AssignedTeam").Preload("Folder.AssignedBranch").
 		Preload("Sections", func(db *gorm.DB) *gorm.DB { return db.Order("sort_order ASC") }).
 		Where("folder_id IN (?)", ApplyFolderScope(a.db.Model(&models.AppFolder{}), a.user).Select("id"))
 	if key != "" {
-		q = q.Where("app_code = ? OR app_name LIKE ?", key, "%"+escapeLike(key)+"%")
+		q = q.Where("LOWER(app_code) = LOWER(?) OR app_name ILIKE ?", key, "%"+escapeLike(key)+"%")
 	}
 	var apps []models.Application
-	q.Order("app_name").Limit(limit).Find(&apps)
-	return apps
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	err := q.Order("app_name").Find(&apps).Error
+	return apps, err
 }
 
 func runGetApplicationTool(ctx context.Context, a *agentRun, args map[string]any, st *AgentStep) toolResult {
 	key := argString(args, "app")
 	if key == "" {
-		key = argString(args, "app_code")
-	}
-	if key == "" {
 		return errorResult("app wajib diisi (kode aplikasi atau potongan namanya)")
 	}
-	apps := a.scopedApplications(key, 5)
+	apps, err := a.scopedApplications(key, 0)
+	if err != nil {
+		return errorResult("Profil aplikasi gagal dimuat; coba lagi.")
+	}
 	var app *models.Application
 	for i := range apps {
 		if strings.EqualFold(apps[i].AppCode, key) {
@@ -778,7 +868,10 @@ func runGetApplicationTool(ctx context.Context, a *agentRun, args map[string]any
 		var names []string
 		list := apps
 		if len(list) == 0 {
-			list = a.scopedApplications("", 20)
+			list, err = a.scopedApplications("", 0)
+			if err != nil {
+				return errorResult("Profil aplikasi gagal dimuat; coba lagi.")
+			}
 		}
 		for _, x := range list {
 			names = append(names, fmt.Sprintf("%s (%s)", x.AppName, x.AppCode))
@@ -787,8 +880,14 @@ func runGetApplicationTool(ctx context.Context, a *agentRun, args map[string]any
 		if len(apps) > 1 {
 			msg = "Beberapa aplikasi cocok; panggil lagi dengan kode yang tepat."
 		}
-		b, _ := json.Marshal(map[string]any{"found": false, "message": msg, "applications_in_scope": names})
-		return toolResult{Output: string(b), Summary: msg}
+		build := func(n int) any {
+			return map[string]any{"found": false, "message": msg, "applications_in_scope": names[:n], "total_matching": len(apps), "total_applications_in_scope": len(names)}
+		}
+		out, shown, truncated, fitErr := fitJSON(build, len(names))
+		if fitErr != "" {
+			return errorResult(fitErr)
+		}
+		return toolResult{Output: out, Summary: msg, Count: shown, Truncated: truncated}
 	}
 
 	sections := app.Sections
@@ -816,7 +915,6 @@ func runGetApplicationTool(ctx context.Context, a *agentRun, args map[string]any
 			present[d.DocCategory] = true
 			v.Documents = append(v.Documents, listItem{Ref: a.docRef(d), Title: d.Title, Category: d.DocCategory, Version: d.VersionLabel,
 				Module: moduleLabel(d.ModuleSource), UploadedBy: d.UploadedByName, UploadedAt: d.UploadedAt.In(wib).Format("2006-01-02")})
-			res.Results = append(res.Results, StepResult{Ref: a.docRef(d), DocumentID: d.ID, Title: d.Title, Category: d.DocCategory, Version: d.VersionLabel})
 		}
 		core := coreChangeCategories
 		if s.IsInitialRelease {
@@ -850,10 +948,20 @@ func runGetApplicationTool(ctx context.Context, a *agentRun, args map[string]any
 				"description": clip(app.Description, toolSummaryRunes), "folder": folder, "team": team},
 			"versions":       vs,
 			"total_versions": len(versions),
+			"total_matching": len(versions),
 			"note":           "missing_core_categories adalah kategori dokumen inti yang belum ada (panduan PANDA: versi awal PRD, FSD, UAT, BAST; versi perubahan PRD, UAT, BAST), bukan aturan wajib.",
 		}
 	}
-	out, _, truncated := fitJSON(build, len(versions))
+	out, shown, truncated, fitErr := fitJSON(build, len(versions))
+	if fitErr != "" {
+		return errorResult(fitErr)
+	}
+	for _, version := range versions[len(versions)-shown:] {
+		for _, item := range version.Documents {
+			d := a.byDRef[item.Ref]
+			res.Results = append(res.Results, StepResult{Ref: item.Ref, DocumentID: d.ID, Title: d.Title, Category: d.DocCategory, Version: d.VersionLabel})
+		}
+	}
 	res.Output, res.Truncated, res.Count, res.Fresh = out, truncated, len(res.Results), len(res.Results)
 	res.Summary = fmt.Sprintf("%s (%s): %d versi, %d dokumen.", app.AppName, app.AppCode, len(versions), len(res.Results))
 	return res
@@ -903,9 +1011,12 @@ func runRepositoryStatsTool(ctx context.Context, a *agentRun, args map[string]an
 		return groups[i].Key < groups[j].Key
 	})
 	build := func(n int) any {
-		return map[string]any{"scope": scopeLabelFor(a.user), "total_documents": len(a.docs), "group_by": groupBy, "groups": groups[:n]}
+		return map[string]any{"scope": scopeLabelFor(a.user), "total_documents": len(a.docs), "group_by": groupBy, "groups": groups[:n], "total_matching": len(groups)}
 	}
-	out, shown, truncated := fitJSON(build, len(groups))
+	out, shown, truncated, fitErr := fitJSON(build, len(groups))
+	if fitErr != "" {
+		return errorResult(fitErr)
+	}
 	return toolResult{Output: out, Count: shown, Truncated: truncated,
 		Summary: fmt.Sprintf("%d dokumen dalam cakupan, %d kelompok per %s.", len(a.docs), len(groups), groupBy)}
 }

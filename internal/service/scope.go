@@ -35,3 +35,17 @@ func CanAccessFolder(user models.User, f models.AppFolder) bool {
 	}
 	return f.AssignedBranchID == nil || *f.AssignedBranchID == "" || *f.AssignedBranchID == *user.BranchID
 }
+
+// ApplyDocumentScope dipakai pencarian, daftar dokumen, dan akses file agar aturan aksesnya sama.
+func ApplyDocumentScope(q *gorm.DB, user models.User) *gorm.DB {
+	if user.IsAdmin() {
+		return q
+	}
+	if user.TeamID == nil {
+		return q.Where("visibility_scope = 'ALL_TIM'")
+	}
+	if user.BranchID != nil {
+		return q.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ? AND (owner_branch_id IS NULL OR owner_branch_id = '' OR owner_branch_id = ?))", *user.TeamID, *user.BranchID)
+	}
+	return q.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ?)", *user.TeamID)
+}

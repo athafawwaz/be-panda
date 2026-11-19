@@ -59,6 +59,15 @@ func AppSecret() string {
 	return defaultJWTSecret
 }
 
+// ValidateAppSecret mencegah token buatan dengan secret publik melewati middleware API.
+func ValidateAppSecret() error {
+	s := strings.TrimSpace(os.Getenv("JWT_SECRET"))
+	if len(s) < 32 || strings.ContainsAny(s, "<>") {
+		return errors.New("JWT_SECRET wajib diisi string acak minimal 32 karakter, bukan placeholder")
+	}
+	return nil
+}
+
 // LLMConfig adalah konfigurasi efektif: nilai dari database (diatur Super Admin) diprioritaskan,
 // lalu fallback ke .env, lalu default.
 type LLMConfig struct {

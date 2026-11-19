@@ -1,17 +1,15 @@
 package handler
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v3"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -41,72 +39,60 @@ const (
 
 // ─── Middleware Auth by JWT ──────────────────────────────────────────────────
 
-func (h *Handler) AuthMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		authHeader := c.GetHeader("Authorization")
+func (h *Handler) AuthMiddleware() fiber.Handler {
+	return func(c fiber.Ctx) error {
+		authHeader := c.Get("Authorization")
 		tokenStr := ""
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
-		} else if qToken := c.Query("token"); qToken != "" {
-			tokenStr = qToken
 		}
 
 		if tokenStr == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token autentikasi diperlukan"})
-			c.Abort()
-			return
+			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "Token autentikasi diperlukan"})
 		}
 
 		token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
 			return h.JWTSecret, nil
-		})
+		}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 		if err != nil || !token.Valid {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token tidak valid atau telah kedaluwarsa"})
-			c.Abort()
-			return
+			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "Token tidak valid atau telah kedaluwarsa"})
 		}
 
 		claims, ok := token.Claims.(jwt.MapClaims)
 		if !ok {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Klaim token tidak valid"})
-			c.Abort()
-			return
+			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "Klaim token tidak valid"})
 		}
 
 		badge, _ := claims["badge_number"].(string)
 		var user models.User
-		if err := h.DB.Preload("Team").Preload("Branch").Where("badge_number = ? AND is_active = 1", badge).First(&user).Error; err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Pengguna tidak ditemukan atau tidak aktif"})
-			c.Abort()
-			return
+		if err := h.DB.Preload("Team").Preload("Branch").Where("badge_number = ? AND is_active = ?", badge, true).First(&user).Error; err != nil {
+			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "Pengguna tidak ditemukan atau tidak aktif"})
 		}
 
-		if teamID := strings.TrimSpace(c.GetHeader(headerImpersonateTeam)); teamID != "" {
-			effective, status, msg := h.buildImpersonatedUser(c, user, teamID, strings.TrimSpace(c.GetHeader(headerImpersonateBranch)))
+		if teamID := strings.TrimSpace(c.Get(headerImpersonateTeam)); teamID != "" {
+			effective, status, msg := h.buildImpersonatedUser(c, user, teamID, strings.TrimSpace(c.Get(headerImpersonateBranch)))
 			if status != 0 {
-				c.JSON(status, gin.H{"error": msg})
-				c.Abort()
-				return
+				return c.Status(status).JSON(fiber.Map{"error": msg})
 			}
-			c.Set("realUser", user)
+			c.Locals("realUser", user)
 			user = effective
 		}
 
-		c.Set("currentUser", user)
-		c.Next()
+		c.Locals("currentUser", user)
+		return c.Next()
 	}
 }
 
 // buildImpersonatedUser membentuk identitas efektif Pegawai TI pada segmen Tim/Branch terpilih,
 // sehingga seluruh filter isolasi data berjalan persis seperti pegawai di segmen tersebut.
 // Mode ini read-only agar tidak ada data yang tercatat atas nama segmen palsu.
-func (h *Handler) buildImpersonatedUser(c *gin.Context, real models.User, teamID, branchID string) (models.User, int, string) {
+func (h *Handler) buildImpersonatedUser(c fiber.Ctx, real models.User, teamID, branchID string) (models.User, int, string) {
 	if real.Role != models.RoleSuperAdmin {
 		return real, http.StatusForbidden, "Hanya Super Admin yang dapat melakukan impersonate segmen"
 	}
 
-	readOnlyAllowed := c.Request.Method == http.MethodGet ||
-		(c.Request.Method == http.MethodPost && c.FullPath() == "/api/v1/ai/chat")
+	readOnlyAllowed := c.Method() == http.MethodGet ||
+		(c.Method() == http.MethodPost && (c.Path() == "/api/v1/ai/chat" || c.Path() == "/api/v1/ai/chat/stream"))
 	if !readOnlyAllowed {
 		return real, http.StatusForbidden, "Mode impersonate bersifat read-only. Keluar dari impersonate untuk mengubah data."
 	}
@@ -134,49 +120,35 @@ func (h *Handler) buildImpersonatedUser(c *gin.Context, real models.User, teamID
 	return effective, 0, ""
 }
 
-func getCurrentUser(c *gin.Context) models.User {
-	val, exists := c.Get("currentUser")
-	if !exists {
+func getCurrentUser(c fiber.Ctx) models.User {
+	val := c.Locals("currentUser")
+	if val == nil {
 		return models.User{}
 	}
 	return val.(models.User)
 }
 
 // getRealUser mengembalikan akun yang benar-benar login (berbeda dari currentUser saat impersonate).
-func getRealUser(c *gin.Context) (models.User, bool) {
-	if val, exists := c.Get("realUser"); exists {
+func getRealUser(c fiber.Ctx) (models.User, bool) {
+	if val := c.Locals("realUser"); val != nil {
 		return val.(models.User), true
 	}
 	return getCurrentUser(c), false
 }
 
-func formatUserTeamLabel(u models.User) string {
-	switch u.Role {
-	case models.RoleSuperAdmin:
-		return "Super Admin (Semua Tim)"
-	case models.RoleAdmin:
-		return "Administrator (Semua Tim)"
-	}
-	if u.Team != nil && u.Branch != nil {
-		return fmt.Sprintf("%s • %s", u.Team.TeamName, u.Branch.BranchName)
-	}
-	if u.Team != nil {
-		return u.Team.TeamName
-	}
-	return "Pegawai TI"
-}
+func formatUserTeamLabel(u models.User) string { return service.UserTeamLabel(u) }
 
 // ─── Public Landing Page Stats ───────────────────────────────────────────────
 
-func (h *Handler) GetPublicStats(c *gin.Context) {
+func (h *Handler) GetPublicStats(c fiber.Ctx) error {
 	var totalApps, totalAppDocs, totalEvidence, totalDocs int64
 	h.DB.Model(&models.Application{}).Count(&totalApps)
 	h.DB.Model(&models.Document{}).Where("module_source = ?", "APPLICATION").Count(&totalAppDocs)
 	h.DB.Model(&models.Document{}).Where("module_source = ?", "EVIDENCE").Count(&totalEvidence)
 	h.DB.Model(&models.Document{}).Count(&totalDocs)
 
-	c.JSON(http.StatusOK, gin.H{
-		"data": gin.H{
+	return c.Status(http.StatusOK).JSON(fiber.Map{
+		"data": fiber.Map{
 			"total_apps":       totalApps,
 			"total_app_docs":   totalAppDocs,
 			"total_evidence":   totalEvidence,
@@ -193,11 +165,11 @@ type loginRequest struct {
 	Password    string `json:"password" binding:"required"`
 }
 
-func (h *Handler) Login(c *gin.Context) {
+func (h *Handler) Login(c fiber.Ctx) error {
 	var req loginRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Nomor Badge dan Password wajib diisi"})
-		return
+	if err := c.Bind().JSON(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Nomor Badge dan Password wajib diisi"})
+
 	}
 
 	badge := strings.TrimSpace(req.BadgeNumber)
@@ -209,19 +181,19 @@ func (h *Handler) Login(c *gin.Context) {
 
 	var user models.User
 	if err := h.DB.Preload("Team").Preload("Branch").Where("badge_number = ?", badge).First(&user).Error; err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": fmt.Sprintf("Badge %s belum terdaftar di Master Akses PANDA", badge)})
-		return
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": fmt.Sprintf("Badge %s belum terdaftar di Master Akses PANDA", badge)})
+
 	}
 
 	if !user.IsActive {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Akun Badge Anda sedang dinonaktifkan oleh Admin"})
-		return
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "Akun Badge Anda sedang dinonaktifkan oleh Admin"})
+
 	}
 
 	// Verify bypass password "Panda" or user's stored password
 	if !strings.EqualFold(pass, bypass) && pass != user.PasswordHash {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Password tidak sesuai (Gunakan password bypass: Panda)"})
-		return
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "Password tidak sesuai (Gunakan password bypass: Panda)"})
+
 	}
 
 	claims := jwt.MapClaims{
@@ -233,20 +205,20 @@ func (h *Handler) Login(c *gin.Context) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := token.SignedString(h.JWTSecret)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membuat token sesi"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal membuat token sesi"})
+
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	return c.Status(http.StatusOK).JSON(fiber.Map{
 		"token": signed,
 		"user":  user,
 	})
 }
 
-func (h *Handler) GetMe(c *gin.Context) {
+func (h *Handler) GetMe(c fiber.Ctx) error {
 	user := getCurrentUser(c)
 	real, impersonating := getRealUser(c)
-	c.JSON(http.StatusOK, gin.H{
+	return c.Status(http.StatusOK).JSON(fiber.Map{
 		"user":          user,
 		"real_user":     real,
 		"impersonating": impersonating,
@@ -255,22 +227,12 @@ func (h *Handler) GetMe(c *gin.Context) {
 
 // ─── Dashboard Summary (Bento Grid Data) ─────────────────────────────────────
 
-func (h *Handler) GetDashboardSummary(c *gin.Context) {
+func (h *Handler) GetDashboardSummary(c fiber.Ctx) error {
 	user := getCurrentUser(c)
 
-	folderQuery := h.DB.Model(&models.AppFolder{}).Preload("AssignedTeam").Preload("AssignedBranch").Preload("Applications")
-	docQuery := h.DB.Model(&models.Document{}).Preload("Application").Preload("Folder").Preload("Section")
-	logQuery := h.DB.Model(&models.UploadAuditLog{})
-
-	if !user.IsAdmin() {
-		if user.TeamID != nil && user.BranchID != nil {
-			folderQuery = folderQuery.Where("assigned_team_id = ? AND (assigned_branch_id IS NULL OR assigned_branch_id = '' OR assigned_branch_id = ?)", *user.TeamID, *user.BranchID)
-			docQuery = docQuery.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ? AND (owner_branch_id IS NULL OR owner_branch_id = '' OR owner_branch_id = ?))", *user.TeamID, *user.BranchID)
-		} else if user.TeamID != nil {
-			folderQuery = folderQuery.Where("assigned_team_id = ?", *user.TeamID)
-			docQuery = docQuery.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ?)", *user.TeamID)
-		}
-	}
+	folderQuery := applyFolderScope(h.DB.Model(&models.AppFolder{}), user).Preload("AssignedTeam").Preload("AssignedBranch").Preload("Applications")
+	docQuery := service.ApplyDocumentScope(h.DB.Model(&models.Document{}), user).Preload("Application").Preload("Folder").Preload("Section")
+	logQuery := h.scopedUploadLogs(c)
 
 	var folders []models.AppFolder
 	folderQuery.Order("created_at DESC").Find(&folders)
@@ -323,10 +285,10 @@ func (h *Handler) GetDashboardSummary(c *gin.Context) {
 	}
 
 	var totalUsers int64
-	h.DB.Model(&models.User{}).Where("is_active = 1").Count(&totalUsers)
+	h.DB.Model(&models.User{}).Where("is_active = ?", true).Count(&totalUsers)
 
-	c.JSON(http.StatusOK, gin.H{
-		"summary": gin.H{
+	return c.Status(http.StatusOK).JSON(fiber.Map{
+		"summary": fiber.Map{
 			"total_folders":       len(folders),
 			"total_apps":          totalApps,
 			"total_app_docs":      appDocsCount,
@@ -345,7 +307,7 @@ func (h *Handler) GetDashboardSummary(c *gin.Context) {
 
 // ─── Fitur Aplikasi: Folder Tim -> Aplikasi -> Section Perubahan ─────────────
 
-func (h *Handler) GetFolders(c *gin.Context) {
+func (h *Handler) GetFolders(c fiber.Ctx) error {
 	user := getCurrentUser(c)
 	query := h.DB.Model(&models.AppFolder{}).
 		Preload("AssignedTeam").
@@ -358,7 +320,7 @@ func (h *Handler) GetFolders(c *gin.Context) {
 
 	var folders []models.AppFolder
 	query.Order("created_at DESC").Find(&folders)
-	c.JSON(http.StatusOK, gin.H{"folders": folders})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"folders": folders})
 }
 
 type createFolderRequest struct {
@@ -368,17 +330,17 @@ type createFolderRequest struct {
 	AssignedBranchID *string `json:"assigned_branch_id"`
 }
 
-func (h *Handler) CreateFolder(c *gin.Context) {
+func (h *Handler) CreateFolder(c fiber.Ctx) error {
 	user := getCurrentUser(c)
 	if !user.IsAdmin() {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Hanya Admin yang dapat membuat Folder dan meng-assign ke Tim"})
-		return
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "Hanya Admin yang dapat membuat Folder dan meng-assign ke Tim"})
+
 	}
 
 	var req createFolderRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Nama Folder dan Tim tujuan wajib diisi"})
-		return
+	if err := c.Bind().JSON(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Nama Folder dan Tim tujuan wajib diisi"})
+
 	}
 
 	var branchID *string
@@ -397,8 +359,8 @@ func (h *Handler) CreateFolder(c *gin.Context) {
 	}
 
 	if err := h.DB.Create(&folder).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membuat folder"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal membuat folder"})
+
 	}
 
 	h.DB.Preload("AssignedTeam").Preload("AssignedBranch").First(&folder, "id = ?", folder.ID)
@@ -424,7 +386,7 @@ func (h *Handler) CreateFolder(c *gin.Context) {
 		ActionTimestamp:    time.Now(),
 	})
 
-	c.JSON(http.StatusCreated, gin.H{"folder": folder})
+	return c.Status(http.StatusCreated).JSON(fiber.Map{"folder": folder})
 }
 
 type createAppRequest struct {
@@ -436,24 +398,38 @@ type createAppRequest struct {
 	InitialTitle   string `json:"initial_title"`
 }
 
-func (h *Handler) CreateApplication(c *gin.Context) {
+func (h *Handler) CreateApplication(c fiber.Ctx) error {
 	user := getCurrentUser(c)
 	if !user.IsAdmin() {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Hanya Admin yang dapat menambahkan Aplikasi ke dalam Folder Tim"})
-		return
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "Hanya Admin yang dapat menambahkan Aplikasi ke dalam Folder Tim"})
+
 	}
 
-	folderID := c.Param("id")
+	folderID := c.Params("id")
 	var folder models.AppFolder
-	if err := h.DB.Preload("AssignedTeam").Preload("AssignedBranch").First(&folder, "id = ?", folderID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Folder tidak ditemukan"})
-		return
+	if err := h.DB.WithContext(c.Context()).First(&folder, "id = ?", folderID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Folder tidak ditemukan"})
+		} else {
+			log.Printf("[Application] gagal memuat folder: %v", err)
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal membaca folder"})
+		}
+
 	}
 
 	var req createAppRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Kode dan Nama Aplikasi wajib diisi"})
-		return
+	if err := c.Bind().JSON(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Kode dan Nama Aplikasi wajib diisi"})
+
+	}
+
+	initVer := strings.TrimSpace(req.InitialVersion)
+	if initVer == "" {
+		initVer = "v1.0"
+	}
+	if !validVersionLabel(initVer) {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Label versi maksimal 50 karakter dan tidak boleh mengandung pemisah path atau karakter khusus nama file"})
+
 	}
 
 	status := req.Status
@@ -472,15 +448,6 @@ func (h *Handler) CreateApplication(c *gin.Context) {
 		CreatedByName:  user.FullName,
 	}
 
-	if err := h.DB.Create(&app).Error; err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Kode Aplikasi sudah digunakan atau gagal disimpan"})
-		return
-	}
-
-	initVer := strings.TrimSpace(req.InitialVersion)
-	if initVer == "" {
-		initVer = "v1.0"
-	}
 	initTitle := strings.TrimSpace(req.InitialTitle)
 	if initTitle == "" {
 		initTitle = "Pembuatan Awal Aplikasi (Initial Release)"
@@ -499,9 +466,8 @@ func (h *Handler) CreateApplication(c *gin.Context) {
 		CreatedByBadge:    user.BadgeNumber,
 		CreatedByName:     user.FullName,
 	}
-	h.DB.Create(&initSection)
 
-	h.DB.Create(&models.UploadAuditLog{
+	audit := models.UploadAuditLog{
 		BadgeNumber:        user.BadgeNumber,
 		UserName:           user.FullName,
 		UserRole:           user.Role,
@@ -513,14 +479,24 @@ func (h *Handler) CreateApplication(c *gin.Context) {
 		SectionVersion:     initSection.VersionLabel,
 		DetailDescription:  fmt.Sprintf("Admin %s (%s) mendaftarkan aplikasi '%s' (%s) di dalam folder '%s'", user.FullName, user.BadgeNumber, app.AppName, app.AppCode, folder.FolderName),
 		ActionTimestamp:    time.Now(),
-	})
+	}
 
-	h.DB.Preload("Sections").Preload("Sections.Documents").First(&app, "id = ?", app.ID)
-	c.JSON(http.StatusCreated, gin.H{"application": app})
+	created, err := service.CreateApplication(c.Context(), h.DB, app, initSection, audit)
+	if err != nil {
+		if errors.Is(err, service.ErrApplicationCodeUsed) {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Kode Aplikasi sudah digunakan"})
+		} else {
+			log.Printf("[Application] gagal membuat aplikasi: %v", err)
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal membuat aplikasi"})
+		}
+
+	}
+	return c.Status(http.StatusCreated).JSON(fiber.Map{"application": created})
 }
 
-func (h *Handler) GetApplicationDetail(c *gin.Context) {
-	appID := c.Param("id")
+func (h *Handler) GetApplicationDetail(c fiber.Ctx) error {
+	user := getCurrentUser(c)
+	appID := c.Params("id")
 	var app models.Application
 	err := h.DB.
 		Preload("Folder").
@@ -534,11 +510,11 @@ func (h *Handler) GetApplicationDetail(c *gin.Context) {
 		}).
 		First(&app, "id = ?", appID).Error
 
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Aplikasi tidak ditemukan"})
-		return
+	if err != nil || app.Folder == nil || !canAccessFolder(user, *app.Folder) {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Aplikasi tidak ditemukan"})
+
 	}
-	c.JSON(http.StatusOK, gin.H{"application": app})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"application": app})
 }
 
 type createSectionRequest struct {
@@ -548,20 +524,25 @@ type createSectionRequest struct {
 	ReleaseDate       string `json:"release_date"`
 }
 
-func (h *Handler) CreateAppSection(c *gin.Context) {
+func (h *Handler) CreateAppSection(c fiber.Ctx) error {
 	user := getCurrentUser(c)
-	appID := c.Param("id")
+	appID := c.Params("id")
 
 	var app models.Application
-	if err := h.DB.Preload("Folder").First(&app, "id = ?", appID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Aplikasi tidak ditemukan"})
-		return
+	if err := h.DB.Preload("Folder").First(&app, "id = ?", appID).Error; err != nil || app.Folder == nil || !canAccessFolder(user, *app.Folder) {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Aplikasi tidak ditemukan"})
+
 	}
 
 	var req createSectionRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Label Versi dan Nama Section Perubahan wajib diisi"})
-		return
+	if err := c.Bind().JSON(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Label Versi dan Nama Section Perubahan wajib diisi"})
+
+	}
+	req.VersionLabel = strings.TrimSpace(req.VersionLabel)
+	if !validVersionLabel(req.VersionLabel) {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Label versi maksimal 50 karakter dan tidak boleh mengandung pemisah path atau karakter khusus nama file"})
+
 	}
 
 	var maxOrder int64
@@ -586,8 +567,8 @@ func (h *Handler) CreateAppSection(c *gin.Context) {
 	}
 
 	if err := h.DB.Create(&section).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membuat section perubahan"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal membuat section perubahan"})
+
 	}
 
 	folderName := ""
@@ -609,12 +590,12 @@ func (h *Handler) CreateAppSection(c *gin.Context) {
 		ActionTimestamp:    time.Now(),
 	})
 
-	c.JSON(http.StatusCreated, gin.H{"section": section})
+	return c.Status(http.StatusCreated).JSON(fiber.Map{"section": section})
 }
 
 // ─── Fitur Menu "Evidence" & Upload Dokumen (dengan Log Siapa & Kapan) ───────
 
-func (h *Handler) GetEvidenceList(c *gin.Context) {
+func (h *Handler) GetEvidenceList(c fiber.Ctx) error {
 	user := getCurrentUser(c)
 	query := h.DB.Model(&models.Document{}).
 		Preload("OwnerTeam").
@@ -628,74 +609,66 @@ func (h *Handler) GetEvidenceList(c *gin.Context) {
 		query = query.Where("module_source = ?", moduleFilter)
 	}
 
-	if !user.IsAdmin() {
-		if user.TeamID != nil && user.BranchID != nil {
-			query = query.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ? AND (owner_branch_id IS NULL OR owner_branch_id = '' OR owner_branch_id = ?))", *user.TeamID, *user.BranchID)
-		} else if user.TeamID != nil {
-			query = query.Where("(visibility_scope = 'ALL_TIM') OR (owner_team_id = ?)", *user.TeamID)
-		} else {
-			query = query.Where("visibility_scope = 'ALL_TIM'")
-		}
-	}
+	query = service.ApplyDocumentScope(query, user)
 
 	var docs []models.Document
 	query.Order("uploaded_at DESC").Find(&docs)
-	c.JSON(http.StatusOK, gin.H{"documents": docs})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"documents": docs})
 }
 
-func (h *Handler) UploadDocument(c *gin.Context) {
+func (h *Handler) UploadDocument(c fiber.Ctx) error {
 	user := getCurrentUser(c)
 	if status, msg := parseUploadForm(c); status != 0 {
-		c.JSON(status, gin.H{"error": msg})
-		return
+		return c.Status(status).JSON(fiber.Map{"error": msg})
+
 	}
 
-	moduleSource := strings.ToUpper(strings.TrimSpace(c.PostForm("module_source")))
+	moduleSource := strings.ToUpper(strings.TrimSpace(c.FormValue("module_source")))
 	if moduleSource == "" {
 		moduleSource = "EVIDENCE"
 	}
 	target, status, msg := h.resolveUploadTarget(user, uploadTarget{
 		ModuleSource:    moduleSource,
-		ApplicationID:   c.PostForm("application_id"),
-		SectionID:       c.PostForm("section_id"),
-		VisibilityScope: c.PostForm("visibility_scope"),
-		TargetTeamID:    c.PostForm("target_team_id"),
-		TargetBranchID:  c.PostForm("target_branch_id"),
+		ApplicationID:   c.FormValue("application_id"),
+		SectionID:       c.FormValue("section_id"),
+		VisibilityScope: c.FormValue("visibility_scope"),
+		TargetTeamID:    c.FormValue("target_team_id"),
+		TargetBranchID:  c.FormValue("target_branch_id"),
 	})
 	if status != 0 {
-		c.JSON(status, gin.H{"error": msg})
-		return
+		return c.Status(status).JSON(fiber.Map{"error": msg})
+
 	}
 
 	file, status, msg := readUploadedFile(c)
 	if status != 0 {
-		c.JSON(status, gin.H{"error": msg})
-		return
+		return c.Status(status).JSON(fiber.Map{"error": msg})
+
 	}
 
 	meta := documentMeta{
-		Category:      c.PostForm("doc_category"),
-		Title:         c.PostForm("title"),
-		ITDomain:      c.PostForm("it_domain"),
-		VersionLabel:  c.PostForm("version_label"),
-		AuditTags:     c.PostForm("audit_tags"),
-		ValidUntil:    c.PostForm("valid_until"),
-		Summary:       c.PostForm("ai_summary"),
+		Category:      c.FormValue("doc_category"),
+		Title:         c.FormValue("title"),
+		ITDomain:      c.FormValue("it_domain"),
+		VersionLabel:  c.FormValue("version_label"),
+		AuditTags:     c.FormValue("audit_tags"),
+		ValidUntil:    c.FormValue("valid_until"),
+		Summary:       c.FormValue("ai_summary"),
 		UploadChannel: UploadChannelManual,
 	}
 	if status, msg := normalizeDocumentMeta(&meta, target, user); status != 0 {
-		c.JSON(status, gin.H{"error": msg})
-		return
+		return c.Status(status).JSON(fiber.Map{"error": msg})
+
 	}
 
 	doc, logEntry, contentIndex, err := h.persistDocument(user, target, meta, file)
 	if err != nil {
 		log.Printf("[Upload] %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan dokumen. Silakan coba lagi."})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menyimpan dokumen. Silakan coba lagi."})
+
 	}
 
-	c.JSON(http.StatusCreated, gin.H{
+	return c.Status(http.StatusCreated).JSON(fiber.Map{
 		"document":      doc,
 		"log":           logEntry,
 		"content_index": contentIndex,
@@ -704,195 +677,55 @@ func (h *Handler) UploadDocument(c *gin.Context) {
 
 // serveDocumentFile mengirim file fisik dokumen. File yang hilang dilaporkan sebagai 404,
 // bukan diganti PDF buatan, agar auditor tidak pernah melihat dokumen yang bukan file asli.
-func (h *Handler) serveDocumentFile(c *gin.Context, disposition string) {
+func (h *Handler) serveDocumentFile(c fiber.Ctx, disposition string) error {
 	var doc models.Document
-	if err := h.DB.First(&doc, "id = ?", c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Dokumen tidak ditemukan"})
-		return
+	if err := service.ApplyDocumentScope(h.DB.Model(&models.Document{}), getCurrentUser(c)).Where("id = ?", c.Params("id")).First(&doc).Error; err != nil {
+		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "Dokumen tidak ditemukan"})
+
 	}
 	// File dibaca dari tempat penyimpanannya (folder lokal atau MinIO, sesuai lokasi yang tercatat)
-	file, info, err := storage.Open(c.Request.Context(), doc.FilePath)
+	file, info, err := storage.Open(c.Context(), doc.FilePath)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			log.Printf("[Storage] file fisik dokumen %s tidak ditemukan: %s", doc.ID, doc.FilePath)
-			c.JSON(http.StatusNotFound, gin.H{"error": "File fisik dokumen tidak ditemukan di storage. Hubungi Admin."})
-			return
+			return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "File fisik dokumen tidak ditemukan di storage. Hubungi Admin."})
+
 		}
 		log.Printf("[Storage] file dokumen %s tidak dapat dibaca (%s): %v", doc.ID, doc.FilePath, err)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "Storage dokumen sedang tidak dapat diakses. Coba lagi atau hubungi Admin."})
-		return
-	}
-	defer file.Close()
+		return c.Status(http.StatusBadGateway).JSON(fiber.Map{"error": "Storage dokumen sedang tidak dapat diakses. Coba lagi atau hubungi Admin."})
 
-	c.Header("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, doc.StandardizedName))
-	if disposition == "inline" && strings.HasSuffix(strings.ToLower(doc.StandardizedName), ".pdf") {
-		c.Header("Content-Type", "application/pdf")
 	}
-	// ServeContent melayani HTTP Range sehingga pratinjau PDF tetap bisa dibuka per halaman
-	http.ServeContent(c.Writer, c.Request, doc.StandardizedName, info.ModTime, file)
+	return sendDocument(c, doc.StandardizedName, disposition, file, info)
 }
 
-func (h *Handler) PreviewDocument(c *gin.Context) {
-	h.serveDocumentFile(c, "inline")
+func (h *Handler) PreviewDocument(c fiber.Ctx) error {
+	return h.serveDocumentFile(c, "inline")
 }
 
-func (h *Handler) DownloadDocument(c *gin.Context) {
-	h.serveDocumentFile(c, "attachment")
+func (h *Handler) DownloadDocument(c fiber.Ctx) error {
+	return h.serveDocumentFile(c, "attachment")
 }
 
 // ─── Detail Log Aktivitas & Upload ───────────────────────────────────────────
 
-func (h *Handler) GetUploadLogs(c *gin.Context) {
+// scopedUploadLogs memakai ID dokumen, bukan label tim yang bisa berubah atau cocok sebagian.
+func (h *Handler) scopedUploadLogs(c fiber.Ctx) *gorm.DB {
 	user := getCurrentUser(c)
 	query := h.DB.Model(&models.UploadAuditLog{})
-
-	if !user.IsAdmin() {
-		teamLabel := formatUserTeamLabel(user)
-		if _, impersonating := getRealUser(c); impersonating {
-			// Segmen impersonate tidak punya log "milik sendiri"; jangan ikutkan log pribadi Super Admin
-			query = query.Where("team_and_branch_label LIKE ? OR visibility_label LIKE ?",
-				"%"+teamLabel+"%", "%Semua Tim%")
-		} else {
-			query = query.Where("badge_number = ? OR team_and_branch_label LIKE ? OR visibility_label LIKE ?",
-				user.BadgeNumber, "%"+teamLabel+"%", "%Semua Tim%")
-		}
+	if user.IsAdmin() {
+		return query
 	}
+	docs := service.ApplyDocumentScope(h.DB.Model(&models.Document{}), user).Select("id")
+	if _, impersonating := getRealUser(c); impersonating {
+		return query.Where("action_type <> ? AND document_id IN (?)", "AI_SEARCH", docs)
+	}
+	return query.Where("badge_number = ? OR (action_type <> ? AND document_id IN (?))", user.BadgeNumber, "AI_SEARCH", docs)
+}
+
+func (h *Handler) GetUploadLogs(c fiber.Ctx) error {
+	query := h.scopedUploadLogs(c)
 
 	var logs []models.UploadAuditLog
 	query.Order("action_timestamp DESC").Limit(100).Find(&logs)
-	c.JSON(http.StatusOK, gin.H{"logs": logs})
-}
-
-// ─── Agentic AI Chat Endpoint (Team-Scoped RAG) ──────────────────────────────
-
-func (h *Handler) AgenticAIChat(c *gin.Context) {
-	user := getCurrentUser(c)
-	var req service.AIChatRequest
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Prompt) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Pertanyaan / Prompt tidak boleh kosong"})
-		return
-	}
-
-	// Riwayat percakapan dibaca dari sesi milik akun asli (pemilik riwayat chat); jumlahnya diatur di Docs → API Key
-	actor, impersonating := getRealUser(c)
-
-	resp, err := service.ProcessAgenticQuery(h.DB, user, req, actor.ID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memproses pencarian Agentic AI"})
-		return
-	}
-	h.recordAgenticChat(user, actor, impersonating, req, resp)
-	c.JSON(http.StatusOK, resp)
-}
-
-// recordAgenticChat mencatat pencarian Agentic AI di log audit dan menyimpannya ke riwayat chat milik user.
-func (h *Handler) recordAgenticChat(user, actor models.User, impersonating bool, req service.AIChatRequest, resp *service.AIChatResponse) {
-	// Saat impersonate, log dicatat atas identitas asli Super Admin agar tidak tercampur ke log segmen
-	mode := ""
-	if req.Thinking && resp.Trace != nil {
-		mode = fmt.Sprintf(" [Thinking: %d pencarian, %d token]", resp.Trace.Searches, resp.Trace.Usage.TotalTokens)
-	}
-	detail := fmt.Sprintf("%s (Badge %s) mencari di Agentic AI: \"%s\" (%d dokumen ditemukan)%s", actor.FullName, actor.BadgeNumber, req.Prompt, len(resp.MatchedDocuments), mode)
-	if impersonating {
-		detail += fmt.Sprintf(" [impersonate sebagai %s]", formatUserTeamLabel(user))
-	}
-
-	h.DB.Create(&models.UploadAuditLog{
-		BadgeNumber:        actor.BadgeNumber,
-		UserName:           actor.FullName,
-		UserRole:           actor.Role,
-		TeamAndBranchLabel: formatUserTeamLabel(actor),
-		ActionType:         "AI_SEARCH",
-		ModuleSource:       "AGENTIC_AI",
-		VisibilityLabel:    resp.ScopeLabel,
-		DetailDescription:  truncateUTF8(detail, 1000),
-		ActionTimestamp:    time.Now(),
-	})
-
-	// Simpan ke riwayat chat milik user. Saat impersonate (mode pratinjau read-only) tidak disimpan
-	// agar riwayat Super Admin tidak tercampur dengan hasil pencarian segmen lain.
-	if !impersonating {
-		if sessionID, messageID, err := h.saveChatTurn(actor, req.SessionID, req, resp); err != nil {
-			log.Printf("[Agentic AI] gagal menyimpan riwayat chat: %v", err)
-		} else {
-			resp.SessionID, resp.MessageID = sessionID, messageID
-		}
-	}
-}
-
-// AgenticAIChatStream menjawab pertanyaan Agentic AI sambil mengirim progres lewat Server-Sent Events:
-// "step" (langkah AI: menimbang, mencari, membaca, menilai ulang, menyusun jawaban), "usage" (token),
-// "answer_delta"/"answer_reset" (jawaban mengalir), lalu "done" (jawaban lengkap) atau "error".
-// Menutup koneksi (tombol Stop) membatalkan pencarian & panggilan LLM yang sedang berjalan.
-func (h *Handler) AgenticAIChatStream(c *gin.Context) {
-	user := getCurrentUser(c)
-	var req service.AIChatRequest
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Prompt) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Pertanyaan / Prompt tidak boleh kosong"})
-		return
-	}
-	actor, impersonating := getRealUser(c)
-
-	c.Header("Content-Type", "text/event-stream")
-	// no-transform: proxy/kompresor (mis. gzip pada rewrite Next.js) tidak boleh menampung stream; tanpa ini
-	// langkah AI & jawaban baru tiba sekaligus di akhir
-	c.Header("Cache-Control", "no-cache, no-transform")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-	c.Status(http.StatusOK)
-
-	// Semua penulisan ke response dijaga mutex; setelah handler selesai (closed) tidak ada lagi yang menulis
-	var mu sync.Mutex
-	closed := false
-	emit := func(event string, data any) {
-		payload, err := json.Marshal(data)
-		if err != nil {
-			return
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if closed {
-			return
-		}
-		fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, payload)
-		c.Writer.Flush()
-	}
-	defer func() {
-		mu.Lock()
-		closed = true
-		mu.Unlock()
-	}()
-
-	// Detak berkala agar koneksi tidak diputus proxy saat menunggu LLM
-	ctx := c.Request.Context()
-	go func() {
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				mu.Lock()
-				if closed {
-					mu.Unlock()
-					return
-				}
-				fmt.Fprint(c.Writer, ": ping\n\n")
-				c.Writer.Flush()
-				mu.Unlock()
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	resp, err := service.AnswerAgenticQuery(ctx, h.DB, user, req, actor.ID, emit)
-	if err != nil {
-		if ctx.Err() == nil {
-			log.Printf("[Agentic AI] stream gagal: %v", err)
-			emit("error", gin.H{"error": "Gagal memproses pencarian Agentic AI"})
-		}
-		return
-	}
-	h.recordAgenticChat(user, actor, impersonating, req, resp)
-	emit("done", resp)
+	return c.Status(http.StatusOK).JSON(fiber.Map{"logs": logs})
 }

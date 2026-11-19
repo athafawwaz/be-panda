@@ -5,17 +5,17 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v3"
 
 	"panda-backend/internal/models"
 	"panda-backend/internal/service"
 )
 
 // GetAIQuota memberi status kuota AI ringkas untuk peringatan di halaman chat (semua user).
-func (h *Handler) GetAIQuota(c *gin.Context) {
+func (h *Handler) GetAIQuota(c fiber.Ctx) error {
 	cfg := service.LoadLLMConfig(h.DB)
 	st := service.GetLLMQuotaStatus(h.DB, cfg, false)
-	c.JSON(http.StatusOK, gin.H{"quota": gin.H{
+	return c.Status(http.StatusOK).JSON(fiber.Map{"quota": fiber.Map{
 		"engine":          service.EngineLabel(cfg, service.LoadRerankConfig(h.DB)),
 		"status":          st.Status,
 		"message":         st.Message,
@@ -29,24 +29,24 @@ func (h *Handler) GetAIQuota(c *gin.Context) {
 }
 
 // GetAIQuotaDetail memberi detail pemakaian kuota AI & rekap 7 hari untuk menu Docs (Super Admin).
-func (h *Handler) GetAIQuotaDetail(c *gin.Context) {
+func (h *Handler) GetAIQuotaDetail(c fiber.Ctx) error {
 	st := service.GetLLMQuotaStatus(h.DB, service.LoadLLMConfig(h.DB), true)
-	c.JSON(http.StatusOK, gin.H{"quota": st})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"quota": st})
 }
 
 // UpdateAIQuotaLimit menyimpan batas permintaan harian manual (0 = ikuti batas dari provider).
-func (h *Handler) UpdateAIQuotaLimit(c *gin.Context) {
+func (h *Handler) UpdateAIQuotaLimit(c fiber.Ctx) error {
 	actor := getCurrentUser(c)
 	var req struct {
 		DailyLimit *int `json:"daily_limit"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.DailyLimit == nil || *req.DailyLimit < 0 || *req.DailyLimit > 10_000_000 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Batas permintaan harian harus angka 0 atau lebih"})
-		return
+	if err := c.Bind().JSON(&req); err != nil || req.DailyLimit == nil || *req.DailyLimit < 0 || *req.DailyLimit > 10_000_000 {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Batas permintaan harian harus angka 0 atau lebih"})
+
 	}
 	if err := service.SaveLLMDailyLimit(h.DB, *req.DailyLimit, actor.BadgeNumber); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan batas kuota AI"})
-		return
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Gagal menyimpan batas kuota AI"})
+
 	}
 
 	limitLabel := fmt.Sprintf("%d permintaan/hari", *req.DailyLimit)
@@ -64,5 +64,5 @@ func (h *Handler) UpdateAIQuotaLimit(c *gin.Context) {
 		ActionTimestamp:    time.Now(),
 	})
 
-	c.JSON(http.StatusOK, gin.H{"quota": service.GetLLMQuotaStatus(h.DB, service.LoadLLMConfig(h.DB), true)})
+	return c.Status(http.StatusOK).JSON(fiber.Map{"quota": service.GetLLMQuotaStatus(h.DB, service.LoadLLMConfig(h.DB), true)})
 }

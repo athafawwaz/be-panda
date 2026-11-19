@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/logger"
+	"github.com/gofiber/fiber/v3/middleware/recover"
 	"github.com/joho/godotenv"
 
 	"panda-backend/internal/database"
@@ -17,6 +19,10 @@ import (
 func main() {
 	_ = godotenv.Load(".env")
 	_ = godotenv.Load("../.env")
+
+	if err := service.ValidateAppSecret(); err != nil {
+		log.Fatalf("Invalid JWT configuration: %v", err)
+	}
 
 	db, err := database.ConnectAndMigrate()
 	if err != nil {
@@ -36,106 +42,112 @@ func main() {
 	// Bersihkan file staging upload via Agentic AI yang tidak dikonfirmasi (kedaluwarsa 1 jam)
 	go service.RunStagingJanitor(db)
 
-	r := gin.Default()
-
-	// CORS Middleware
-	r.Use(func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, X-Impersonate-Team, X-Impersonate-Branch")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, PATCH, DELETE")
-
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(http.StatusNoContent)
-			return
-		}
-		c.Next()
-	})
-
-	h := handler.NewHandler(db)
-
-	api := r.Group("/api/v1")
-	{
-		// Public endpoints
-		api.GET("/public/stats", h.GetPublicStats)
-		api.POST("/auth/login", h.Login)
-		// Preview & Download endpoints (support direct link click & iframe preview)
-		api.GET("/documents/:id/preview", h.PreviewDocument)
-		api.GET("/documents/:id/download", h.DownloadDocument)
-
-		// Protected endpoints
-		protected := api.Group("")
-		protected.Use(h.AuthMiddleware())
-		{
-			protected.GET("/auth/me", h.GetMe)
-			protected.GET("/dashboard/summary", h.GetDashboardSummary)
-
-			// Master Data Tim, Branch & Master Akses (Badge RBAC)
-			protected.GET("/master/teams", h.GetMasterTeams)
-			protected.POST("/master/teams", h.CreateMasterTeam)
-			protected.PUT("/master/teams/:id", h.UpdateMasterTeam)
-			protected.DELETE("/master/teams/:id", h.DeleteMasterTeam)
-			protected.POST("/master/branches", h.CreateMasterBranch)
-			protected.PUT("/master/branches/:id", h.UpdateMasterBranch)
-			protected.DELETE("/master/branches/:id", h.DeleteMasterBranch)
-			protected.GET("/master/users", h.GetMasterUsers)
-			protected.POST("/master/users", h.CreateMasterUser)
-			protected.PUT("/master/users/:id", h.UpdateMasterUser)
-			protected.DELETE("/master/users/:id", h.DeleteMasterUser)
-
-			// Hirarki Aplikasi: Folder Tim -> Aplikasi -> Section Perubahan (Versioning)
-			protected.GET("/folders", h.GetFolders)
-			protected.POST("/folders", h.CreateFolder)
-			protected.POST("/folders/:id/applications", h.CreateApplication)
-			protected.GET("/applications/:id", h.GetApplicationDetail)
-			protected.POST("/applications/:id/sections", h.CreateAppSection)
-
-			// Menu Evidence & Document Upload
-			protected.GET("/evidence", h.GetEvidenceList)
-			protected.POST("/documents/upload", h.UploadDocument)
-
-			// Log Aktivitas & Upload Detail
-			protected.GET("/logs", h.GetUploadLogs)
-
-			// Agentic AI Chat (Team-Scoped RAG + Dual Mode)
-			protected.POST("/ai/chat", h.AgenticAIChat)
-			protected.POST("/ai/chat/stream", h.AgenticAIChatStream)
-			protected.GET("/ai/chat/shortcuts", h.GetAIChatShortcuts)
-			// Riwayat chat Agentic AI (hanya milik user yang login)
-			protected.GET("/ai/chat/sessions", h.GetChatSessions)
-			protected.GET("/ai/chat/sessions/:id", h.GetChatSession)
-			protected.DELETE("/ai/chat/sessions/:id", h.DeleteChatSession)
-			// Status kuota AI untuk peringatan di halaman chat
-			protected.GET("/ai/quota", h.GetAIQuota)
-
-			// Upload via Agentic AI: analisis (AI memberi pilihan) -> konfirmasi user
-			protected.POST("/ai/upload/analyze", h.AnalyzeAIUpload)
-			protected.POST("/ai/upload/confirm", h.ConfirmAIUpload)
-			protected.DELETE("/ai/upload/:id", h.CancelAIUpload)
-
-			// Khusus Super Admin: Setting API Key Agentic AI (menu Docs)
-			superAdmin := protected.Group("/admin")
-			superAdmin.Use(h.RequireSuperAdmin())
-			{
-				superAdmin.GET("/settings/ai", h.GetAISettings)
-				superAdmin.PUT("/settings/ai", h.UpdateAISettings)
-				superAdmin.POST("/settings/ai/test", h.TestAISettings)
-				superAdmin.GET("/settings/ai/quota", h.GetAIQuotaDetail)
-				superAdmin.PUT("/settings/ai/quota", h.UpdateAIQuotaLimit)
-				superAdmin.GET("/settings/rerank", h.GetRerankSettings)
-				superAdmin.PUT("/settings/rerank", h.UpdateRerankSettings)
-				superAdmin.POST("/settings/rerank/test", h.TestRerankSettings)
-			}
-		}
-	}
-
+	r := newRouter(handler.NewHandler(db))
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-
 	log.Printf("🐼 PANDA Backend Server running on http://localhost:%s", port)
-	if err := r.Run(":" + port); err != nil {
+	if err := r.Listen(":" + port); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
+}
+
+func newRouter(h *handler.Handler) *fiber.App {
+	r := fiber.New(handler.HTTPConfig())
+	r.Use(recover.New(), logger.New())
+	r.Use(func(c fiber.Ctx) error {
+		c.Set("Access-Control-Allow-Origin", "*")
+		c.Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, X-Impersonate-Team, X-Impersonate-Branch")
+		c.Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, PATCH, DELETE")
+		if c.Method() == http.MethodOptions {
+			return c.SendStatus(http.StatusNoContent)
+		}
+		return c.Next()
+	})
+
+	api := r.Group("/api/v1")
+	{
+		// Public endpoints
+		api.Get("/public/stats", h.GetPublicStats)
+		api.Post("/auth/login", h.Login)
+
+		// Protected endpoints
+		protected := api.Group("")
+		{
+			protected.Get("/auth/me", h.AuthMiddleware(), h.GetMe)
+			protected.Get("/documents/:id/preview", h.AuthMiddleware(), h.PreviewDocument)
+			protected.Get("/documents/:id/download", h.AuthMiddleware(), h.DownloadDocument)
+			protected.Get("/dashboard/summary", h.AuthMiddleware(), h.GetDashboardSummary)
+
+			// Master Data Tim, Branch & Master Akses (Badge RBAC)
+			protected.Get("/master/teams", h.AuthMiddleware(), h.GetMasterTeams)
+			protected.Post("/master/teams", h.AuthMiddleware(), h.CreateMasterTeam)
+			protected.Put("/master/teams/:id", h.AuthMiddleware(), h.UpdateMasterTeam)
+			protected.Delete("/master/teams/:id", h.AuthMiddleware(), h.DeleteMasterTeam)
+			protected.Post("/master/branches", h.AuthMiddleware(), h.CreateMasterBranch)
+			protected.Put("/master/branches/:id", h.AuthMiddleware(), h.UpdateMasterBranch)
+			protected.Delete("/master/branches/:id", h.AuthMiddleware(), h.DeleteMasterBranch)
+			protected.Get("/master/users", h.AuthMiddleware(), h.GetMasterUsers)
+			protected.Post("/master/users", h.AuthMiddleware(), h.CreateMasterUser)
+			protected.Put("/master/users/:id", h.AuthMiddleware(), h.UpdateMasterUser)
+			protected.Delete("/master/users/:id", h.AuthMiddleware(), h.DeleteMasterUser)
+
+			// Hirarki Aplikasi: Folder Tim -> Aplikasi -> Section Perubahan (Versioning)
+			protected.Get("/folders", h.AuthMiddleware(), h.GetFolders)
+			protected.Post("/folders", h.AuthMiddleware(), h.CreateFolder)
+			protected.Post("/folders/:id/applications", h.AuthMiddleware(), h.CreateApplication)
+			protected.Get("/applications/:id", h.AuthMiddleware(), h.GetApplicationDetail)
+			protected.Post("/applications/:id/sections", h.AuthMiddleware(), h.CreateAppSection)
+
+			// Menu Evidence & Document Upload
+			protected.Get("/evidence", h.AuthMiddleware(), h.GetEvidenceList)
+			protected.Post("/documents/upload", h.AuthMiddleware(), h.UploadDocument)
+
+			// Log Aktivitas & Upload Detail
+			protected.Get("/logs", h.AuthMiddleware(), h.GetUploadLogs)
+
+			// Agentic AI Chat (Team-Scoped RAG + Dual Mode)
+			protected.Post("/ai/chat", h.AuthMiddleware(), h.AgenticAIChat)
+			protected.Post("/ai/chat/stream", h.AuthMiddleware(), h.AgenticAIChatStream)
+			protected.Get("/ai/chat/shortcuts", h.AuthMiddleware(), h.GetAIChatShortcuts)
+			// Riwayat chat Agentic AI (hanya milik user yang login)
+			protected.Get("/ai/chat/sessions", h.AuthMiddleware(), h.GetChatSessions)
+			protected.Get("/ai/chat/sessions/:id", h.AuthMiddleware(), h.GetChatSession)
+			protected.Delete("/ai/chat/sessions/:id", h.AuthMiddleware(), h.DeleteChatSession)
+			// Status kuota AI untuk peringatan di halaman chat
+			protected.Get("/ai/quota", h.AuthMiddleware(), h.GetAIQuota)
+
+			// Upload via Agentic AI: analisis (AI memberi pilihan) -> konfirmasi user
+			protected.Post("/ai/upload/analyze", h.AuthMiddleware(), h.AnalyzeAIUpload)
+			protected.Post("/ai/upload/confirm", h.AuthMiddleware(), h.ConfirmAIUpload)
+			protected.Delete("/ai/upload/:id", h.AuthMiddleware(), h.CancelAIUpload)
+
+			// Khusus Super Admin: Setting API Key Agentic AI (menu Docs)
+			superAdmin := protected.Group("/admin")
+			{
+				superAdmin.Get("/settings/ai", h.AuthMiddleware(), h.RequireSuperAdmin(), h.GetAISettings)
+				superAdmin.Put("/settings/ai", h.AuthMiddleware(), h.RequireSuperAdmin(), h.UpdateAISettings)
+				superAdmin.Post("/settings/ai/test", h.AuthMiddleware(), h.RequireSuperAdmin(), h.TestAISettings)
+				superAdmin.Get("/settings/ai/quota", h.AuthMiddleware(), h.RequireSuperAdmin(), h.GetAIQuotaDetail)
+				superAdmin.Put("/settings/ai/quota", h.AuthMiddleware(), h.RequireSuperAdmin(), h.UpdateAIQuotaLimit)
+				superAdmin.Get("/settings/rerank", h.AuthMiddleware(), h.RequireSuperAdmin(), h.GetRerankSettings)
+				superAdmin.Put("/settings/rerank", h.AuthMiddleware(), h.RequireSuperAdmin(), h.UpdateRerankSettings)
+				superAdmin.Post("/settings/rerank/test", h.AuthMiddleware(), h.RequireSuperAdmin(), h.TestRerankSettings)
+			}
+		}
+	}
+
+	r.Use(func(c fiber.Ctx) error {
+		if path := c.Path(); len(path) > 1 && path[len(path)-1] == '/' {
+			target := path[:len(path)-1]
+			for _, route := range r.GetRoutes(true) {
+				if route.Path == target && route.Method == c.Method() {
+					return c.Redirect().Status(http.StatusMovedPermanently).To(target)
+				}
+			}
+		}
+		return c.Status(http.StatusNotFound).SendString("404 page not found")
+	})
+	return r
 }

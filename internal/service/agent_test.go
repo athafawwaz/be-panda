@@ -85,21 +85,6 @@ func TestLatestSectionDocs(t *testing.T) {
 
 // ─── Agen ────────────────────────────────────────────────────────────────────
 
-func TestParseAgentAction(t *testing.T) {
-	act, ok := parseAgentAction("Berikut keputusan:\n```json\n{\"thought\":\"Perlu cek BAST\",\"action\":\"Search\",\"queries\":[\"BAST CorePay\",\"serah terima CorePay\"]}\n```")
-	if !ok || act.Action != "search" || len(act.Queries) != 2 || act.Thought != "Perlu cek BAST" {
-		t.Fatalf("aksi search gagal dibaca: %+v %v", act, ok)
-	}
-	if act, ok := parseAgentAction(`{"action":"finish","refs":[]}`); !ok || act.Action != "finish" {
-		t.Fatalf("finish tanpa bukti tetap sah: %+v", act)
-	}
-	for _, bad := range []string{"tidak ada json", `{"action":"search","queries":[]}`, `{"action":"hapus"}`, `{"action":"read"}`} {
-		if _, ok := parseAgentAction(bad); ok {
-			t.Errorf("keputusan tidak sah harus ditolak: %s", bad)
-		}
-	}
-}
-
 func TestBuiltinQueryPlan(t *testing.T) {
 	known := map[string]bool{"corepay": true, "uat": true, "bast": true}
 	queries := builtinQueryPlan("Apa hasil UAT CorePay dan kapan serah terima CorePay?", known, nil, 6)
@@ -119,36 +104,6 @@ func TestBuiltinQueryPlan(t *testing.T) {
 	}
 	if len(builtinQueryPlan("Apa hasil UAT CorePay dan kapan serah terima CorePay?", known, nil, 2)) != 2 {
 		t.Fatalf("jumlah kueri harus mengikuti batas langkah")
-	}
-}
-
-func TestCompactAgentMessagesKeepsRecentObservationsFull(t *testing.T) {
-	msgs := []agentMsg{{Role: "system", Content: "sistem"}, {Role: "user", Content: "pertanyaan"}}
-	for i := 1; i <= 6; i++ {
-		msgs = append(msgs,
-			agentMsg{Role: "assistant", Content: "keputusan"},
-			agentMsg{Role: "user", Content: "observasi lengkap " + string(rune('0'+i)), Compact: "ringkas " + string(rune('0'+i))})
-	}
-	out := compactAgentMessages(msgs, 4)
-	if len(out) != len(msgs) || out[0]["content"] != "sistem" || out[1]["content"] != "pertanyaan" {
-		t.Fatalf("pesan non-observasi tidak boleh berubah: %v", out[:2])
-	}
-	var got []string
-	for _, m := range out[2:] {
-		if m["role"] == "user" {
-			got = append(got, m["content"])
-		}
-	}
-	want := "ringkas 1|ringkas 2|observasi lengkap 3|observasi lengkap 4|observasi lengkap 5|observasi lengkap 6"
-	if strings.Join(got, "|") != want {
-		t.Fatalf("hanya 4 observasi terbaru yang dikirim utuh:\n%v", got)
-	}
-}
-
-func TestObserveSearchCompact(t *testing.T) {
-	found := []*evidence{{Ref: "E3", Doc: &models.Document{Title: "BAST CorePay", VersionLabel: "v1.1"}}}
-	if got := observeSearchCompact("serah terima", found); !strings.Contains(got, "E3 BAST CorePay (v1.1)") {
-		t.Fatalf("ringkasan observasi harus memuat ref & judul: %q", got)
 	}
 }
 
@@ -176,19 +131,25 @@ func TestTracerEmitsStepsUsageAndAnswer(t *testing.T) {
 // ─── Balas & teruskan ────────────────────────────────────────────────────────
 
 func TestResolveReplyRefFromClientText(t *testing.T) {
-	turn, note := resolveReplyRef(nil, "", &ChatReplyRef{Role: "question", Text: "Apa hasil UAT CorePay?", Mode: "reply"}, false)
+	turn, note, err := resolveReplyRef(nil, "", &ChatReplyRef{Role: "question", Text: "Apa hasil UAT CorePay?", Mode: "reply"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if turn == nil || !turn.Focus || turn.Prompt != "Apa hasil UAT CorePay?" || !strings.Contains(note, "membalas pertanyaannya sendiri") {
 		t.Fatalf("balasan pertanyaan salah: %+v %q", turn, note)
 	}
 
-	turn, note = resolveReplyRef(nil, "", &ChatReplyRef{Role: "answer", Text: "> RAHASIA-ISI\nHasil lulus.", Mode: "forward"}, false)
+	turn, note, err = resolveReplyRef(nil, "", &ChatReplyRef{Role: "answer", Text: "> RAHASIA-ISI\nHasil lulus.", Mode: "forward"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if strings.Contains(note, "RAHASIA-ISI") || !strings.Contains(note, "meneruskan") {
 		t.Fatalf("saat saklar mati, isi jawaban yang tidak dikenal tidak boleh dikirim: %q", note)
 	}
-	if _, note = resolveReplyRef(nil, "", &ChatReplyRef{Role: "answer", Text: "Hasil lulus."}, true); !strings.Contains(note, "Hasil lulus.") {
+	if _, note, err = resolveReplyRef(nil, "", &ChatReplyRef{Role: "answer", Text: "Hasil lulus."}, true); err != nil || !strings.Contains(note, "Hasil lulus.") {
 		t.Fatalf("saat saklar nyala, isi jawaban yang dibalas dikirim: %q", note)
 	}
-	if turn, _ := resolveReplyRef(nil, "", nil, true); turn != nil {
+	if turn, _, err := resolveReplyRef(nil, "", nil, true); err != nil || turn != nil {
 		t.Fatalf("tanpa balasan tidak ada giliran fokus")
 	}
 }

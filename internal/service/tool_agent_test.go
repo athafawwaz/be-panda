@@ -201,9 +201,9 @@ func TestToolAgentReportsToolsUnsupported(t *testing.T) {
 	_, err := runToolAgent(context.Background(), a, nil, "")
 	var unsupported *ErrToolsUnsupported
 	if !errors.As(err, &unsupported) {
-		t.Fatalf("harus mengembalikan ErrToolsUnsupported agar pemanggil beralih ke agen JSON: %v", err)
+		t.Fatalf("harus melaporkan ErrToolsUnsupported tanpa planner pengganti: %v", err)
 	}
-	if a.tr.steps[0].Status != "error" || !strings.Contains(a.tr.steps[0].Detail, "agen penelusuran JSON") {
+	if a.tr.steps[0].Status != "error" || !strings.Contains(a.tr.steps[0].Detail, "pilih model") {
 		t.Fatalf("alasan fallback harus tampil di log: %+v", a.tr.steps[0])
 	}
 	cfgCopy := cfg
@@ -278,23 +278,24 @@ func TestToolAgentUnknownToolAndValidation(t *testing.T) {
 	}
 }
 
-func TestToolAgentFailureFallsBackToBuiltin(t *testing.T) {
+func TestToolAgentFailureDoesNotFallBackToBuiltin(t *testing.T) {
 	round := 0
 	cfg := testLLMServer(t, func(w http.ResponseWriter, body map[string]any) {
 		round++
 		if round == 1 {
-			sseToolCall(w, "", "c1", "get_repository_stats", `{}`)
+			sseToolCall(w, "", "c1", "list_documents", `{}`)
 			return
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
-	resp, err := runToolAgent(context.Background(), newTestToolAgent(cfg, "x", false, nil), nil, "")
-	if err != nil {
-		t.Fatal(err)
+	rec := &recordedEvents{}
+	resp, err := runToolAgent(context.Background(), newTestToolAgent(cfg, "x", false, rec), nil, "")
+	var agentErr *AgentError
+	if resp != nil || !errors.As(err, &agentErr) {
+		t.Fatalf("kegagalan model harus mengembalikan error, bukan jawaban otomatis: resp=%+v err=%v", resp, err)
 	}
-	if !strings.Contains(resp.ReplyMarkdown, "Penjelasan AI sedang tidak tersedia") || resp.AnswerBasis != AnswerBasisGeneral ||
-		!strings.Contains(resp.EngineMode, "Fallback") {
-		t.Fatalf("kegagalan model harus jatuh ke jawaban otomatis: %+v", resp)
+	if !strings.Contains(agentErr.Message, "Tidak ada jawaban pengganti builtin") || rec.deltas.Len() != 0 {
+		t.Fatalf("tidak boleh mengirim ringkasan builtin: err=%v deltas=%q", err, rec.deltas.String())
 	}
 }
 
@@ -347,19 +348,29 @@ func TestIsSmallTalkOrCapability(t *testing.T) {
 	}
 }
 
-func TestRenderAgentMessagesCompactsOldToolResults(t *testing.T) {
-	full, compact := "FULL", "COMPACT"
-	var msgs []agentChatMsg
-	for i := 0; i < 6; i++ {
+func TestRenderAgentMessagesCompactsOnlyPreviouslyDeliveredResults(t *testing.T) {
+	full, compact := strings.Repeat("F", 100), "COMPACT"
+	msgs := []agentChatMsg{
+		{msg: chatMessage{Role: "assistant", ToolCalls: []toolCall{{ID: "old"}}}},
+		{msg: chatMessage{Role: "tool", ToolCallID: "old", Content: &full}, compact: compact},
+		{msg: chatMessage{Role: "assistant", ToolCalls: []toolCall{{ID: "new"}}}},
+	}
+	for i := 0; i < 5; i++ {
 		msgs = append(msgs, agentChatMsg{msg: chatMessage{Role: "tool", ToolCallID: fmt.Sprint(i), Content: &full}, compact: compact})
 	}
-	out := renderAgentMessages(msgs, 4)
-	got := ""
-	for _, m := range out {
-		got += m.text()[:1]
+	out := renderAgentMessages(msgs, 200)
+	if out[1].text() != compact {
+		t.Fatal("hasil lama harus dipadatkan setelah batas konteks")
 	}
-	if got != "CCFFFF" {
-		t.Fatalf("hanya 4 hasil tool terbaru yang dikirim utuh: %s", got)
+	for _, msg := range out[3:] {
+		if msg.text() != full {
+			t.Fatal("hasil putaran terbaru belum boleh dipadatkan")
+		}
+	}
+	for i, msg := range renderAgentMessages(msgs, 0) {
+		if msg.text() != msgs[i].msg.text() {
+			t.Fatal("mode standar harus mempertahankan semua hasil")
+		}
 	}
 }
 

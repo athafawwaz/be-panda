@@ -24,17 +24,17 @@ const (
 	toolAgentStandardCalls  = 8  // tool call maksimal mode standar
 	toolAgentThinkingCalls  = 30 // tool call maksimal mode Thinking
 	toolAgentStandardBudget = 60 * time.Second
-	toolAgentKeepFullTools  = 4 // hasil tool terbaru yang dikirim utuh; yang lebih lama diringkas
+	toolAgentContextChars   = 48000 // batas pemadatan hasil lama dalam mode Thinking
 	toolAgentMaxCitations   = 8
 
 	AnswerBasisDocuments = "DOCUMENTS"
 	AnswerBasisGeneral   = "GENERAL"
 	AnswerBasisMixed     = "MIXED"
 
-	generalEngineMarker = "pengetahuan umum" // penanda engine mode: jawaban tanpa isi dokumen (aman dikirim ulang di riwayat)
+	generalEngineMarker = "pengetahuan umum" // label tampilan saja; privasi memakai DocContentUsed
 )
 
-// Provider yang terbukti menolak parameter tools diingat selama proses berjalan agar tidak dicoba berulang.
+// Dukungan tool hanya untuk status UI; tidak mengalihkan kendali ke planner lain.
 var toolsUnsupported sync.Map
 
 func toolsUnsupportedKey(cfg LLMConfig) string {
@@ -50,7 +50,9 @@ func EngineLabel(cfg LLMConfig, rerank RerankConfig) string {
 	case cfg.UsesExternalLLM() && providerSupportsTools(cfg):
 		label = "PANDA Agent · tool calling · " + cfg.Model
 	case cfg.UsesExternalLLM():
-		label = "PANDA Agent · agen JSON · " + cfg.Model
+		label = "PANDA Agent · tool calling tidak didukung · " + cfg.Model
+	case cfg.Provider != "" && cfg.Provider != ProviderBuiltin:
+		label = "PANDA Agent · API key belum diisi"
 	}
 	if rerank.Enabled() {
 		label += " · reranker " + rerank.Provider
@@ -72,25 +74,28 @@ type agentChatMsg struct {
 	compact string
 }
 
-func renderAgentMessages(msgs []agentChatMsg, keepFull int) []chatMessage {
-	tools := 0
-	for _, m := range msgs {
-		if m.msg.Role == "tool" {
-			tools++
+func renderAgentMessages(msgs []agentChatMsg, maxChars int) []chatMessage {
+	out := make([]chatMessage, len(msgs))
+	chars, latestBatch := 0, len(msgs)
+	for i, m := range msgs {
+		out[i] = m.msg
+		chars += len(m.msg.text())
+		if len(m.msg.ToolCalls) > 0 {
+			latestBatch = i
 		}
 	}
-	out := make([]chatMessage, 0, len(msgs))
-	seen := 0
-	for _, m := range msgs {
-		msg := m.msg
-		if msg.Role == "tool" {
-			seen++
-			if tools-seen >= keepFull && m.compact != "" {
-				c := m.compact
-				msg.Content = &c
-			}
+	if maxChars <= 0 {
+		return out
+	}
+	for i, m := range msgs {
+		if chars <= maxChars || i >= latestBatch {
+			break
 		}
-		out = append(out, msg)
+		if m.msg.Role == "tool" && m.compact != "" && len(m.compact) < len(m.msg.text()) {
+			chars -= len(m.msg.text()) - len(m.compact)
+			c := m.compact
+			out[i].Content = &c
+		}
 	}
 	return out
 }
@@ -217,7 +222,6 @@ type toolAgentBudget struct {
 	rounds   int
 	calls    int
 	deadline time.Time
-	stall    bool // rem penelusuran jenuh (mode Thinking)
 }
 
 func toolBudgetFor(cfg LLMConfig, thinking bool) toolAgentBudget {
@@ -228,15 +232,19 @@ func toolBudgetFor(cfg LLMConfig, thinking bool) toolAgentBudget {
 	if rounds <= 0 {
 		rounds = agentSafetyMaxSteps
 	}
-	return toolAgentBudget{rounds: max(rounds, 2), calls: toolAgentThinkingCalls, deadline: time.Now().Add(agentResearchBudget), stall: true}
+	return toolAgentBudget{rounds: max(rounds, 2), calls: toolAgentThinkingCalls, deadline: time.Now().Add(agentResearchBudget)}
 }
 
-// runToolAgent menjawab dengan agent loop tool calling. Mengembalikan *ErrToolsUnsupported bila provider menolak
-// tools pada putaran pertama, sehingga pemanggil bisa beralih ke agen JSON lama.
+// runToolAgent menyerahkan pemilihan tool dan jawaban ke model; kegagalan dilaporkan tanpa fallback.
 func runToolAgent(ctx context.Context, a *agentRun, history []ChatTurn, replyNote string) (*AIChatResponse, error) {
+	return runToolAgentWithBudget(ctx, a, history, replyNote, toolBudgetFor(a.cfg, a.req.Thinking))
+}
+
+func runToolAgentWithBudget(ctx context.Context, a *agentRun, history []ChatTurn, replyNote string, budget toolAgentBudget) (*AIChatResponse, error) {
 	tr, cfg, req := a.tr, a.cfg, a.req
 	focus := contentSearchTerms(req.Prompt, a.known)
 	a.keys = excerptKeys(append(focus, synonymExpansions(req.Prompt, focus)...))
+	a.docContentUsed = cfg.ShareDocContent && (len(history) > 0 || req.ReplyTo != nil)
 
 	msgs := []agentChatMsg{{msg: textMessage("system", a.toolSystemPrompt(req.Thinking, len(history) > 0))}}
 	for _, m := range chatMessagesFromMaps(historyMessages(history, cfg.ShareDocContent)) {
@@ -244,11 +252,13 @@ func runToolAgent(ctx context.Context, a *agentRun, history []ChatTurn, replyNot
 	}
 	msgs = append(msgs, agentChatMsg{msg: textMessage("user", replyNote+req.Prompt)})
 
-	budget := toolBudgetFor(cfg, req.Thinking)
+	researchCtx, cancelResearch := context.WithDeadline(ctx, budget.deadline)
+	defer cancelResearch()
 	defs := toolDefinitions()
-	calls, stalled := 0, 0
+	calls := 0
 	for round := 1; ; round++ {
 		if ctx.Err() != nil {
+			tr.resetAnswer()
 			return nil, ctx.Err()
 		}
 		force := ""
@@ -257,25 +267,28 @@ func runToolAgent(ctx context.Context, a *agentRun, history []ChatTurn, replyNot
 			force = fmt.Sprintf("Batas %d putaran tercapai; menyusun jawaban dari bukti yang ada.", budget.rounds)
 		case calls >= budget.calls:
 			force = fmt.Sprintf("Batas %d tool call tercapai; menyusun jawaban dari bukti yang ada.", budget.calls)
-		case budget.stall && stalled >= agentStallLimit:
-			force = fmt.Sprintf("%d putaran terakhir tidak menghasilkan temuan baru; menyusun jawaban dari bukti yang ada.", stalled)
-		case time.Now().After(budget.deadline):
+		case researchCtx.Err() != nil:
 			force = "Batas waktu penelusuran tercapai; menyusun jawaban dari bukti yang ada."
 		}
 		choice := "auto"
+		callCtx := researchCtx
+		cancelCall := func() {}
 		if force != "" {
 			choice = "none"
+			callCtx, cancelCall = context.WithTimeout(ctx, agentAnswerTimeout)
+			msgs = append(msgs, agentChatMsg{msg: textMessage("system", force+" Jangan meminta tool lagi. Sebutkan bila bukti belum cukup.")})
 			if round > 1 {
 				a.note("Penelusuran dihentikan", force)
 			}
 		}
 		if a.db != nil {
-			if quota := GetLLMQuotaStatus(a.db, cfg, false); quota.ExhaustedUntil != nil {
+			if quota := GetLLMQuotaStatus(a.db.WithContext(callCtx), cfg, false); quota.ExhaustedUntil != nil {
+				cancelCall()
 				return a.toolAgentFailure(&ErrQuotaExhausted{Until: *quota.ExhaustedUntil})
 			}
 		}
 
-		st := tr.begin("think", "Menimbang langkah berikutnya")
+		st := tr.begin("think", "Menentukan langkah berikutnya")
 		st.Round, st.Model = round, cfg.Model
 		if choice == "none" {
 			st.Title = "Menyusun jawaban"
@@ -283,8 +296,12 @@ func runToolAgent(ctx context.Context, a *agentRun, history []ChatTurn, replyNot
 		tr.update(st)
 		streamed := false
 		var planned []string
-		res, err := chatCompletionStreamTools(ctx, cfg, toolChatRequest{
-			Messages: renderAgentMessages(msgs, toolAgentKeepFullTools), Tools: defs, ToolChoice: choice,
+		maxChars := 0
+		if req.Thinking {
+			maxChars = toolAgentContextChars
+		}
+		res, err := chatCompletionStreamTools(callCtx, cfg, toolChatRequest{
+			Messages: renderAgentMessages(msgs, maxChars), Tools: defs, ToolChoice: choice,
 			Temperature: floatPtr(0.2), Timeout: agentAnswerTimeout,
 		}, func(s string) {
 			streamed = true
@@ -295,28 +312,39 @@ func runToolAgent(ctx context.Context, a *agentRun, history []ChatTurn, replyNot
 			st.Detail = "Memanggil " + strings.Join(planned, ", ") + "…"
 			tr.update(st)
 		})
+		cancelCall()
 		tr.addUsage(st, res.Usage)
 		st.Finish = res.FinishReason
+		if ctx.Err() != nil {
+			tr.resetAnswer()
+			return nil, ctx.Err()
+		}
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
+			if choice != "none" && researchCtx.Err() != nil {
+				tr.resetAnswer()
+				tr.fail(st, "Batas waktu penelusuran tercapai; respons parsial tidak dipakai.")
+				continue
 			}
 			var unsupported *ErrToolsUnsupported
 			if errors.As(err, &unsupported) && round == 1 {
-				tr.fail(st, "Provider tidak mendukung tool calling; beralih ke agen penelusuran JSON.")
-				return nil, err
+				markToolsUnsupported(cfg)
+				tr.fail(st, "Model tidak mendukung tool calling; pilih model yang mendukung tools di Docs → AI.")
+				return a.toolAgentFailure(err)
 			}
 			log.Printf("[Agentic AI] agent loop gagal di putaran %d: %v", round, err)
-			tr.fail(st, "Model tidak dapat dihubungi: "+describeLLMFailure(err))
-			if streamed {
-				tr.resetAnswer()
-			}
+			tr.fail(st, "Permintaan model gagal: "+describeLLMFailure(err))
 			return a.toolAgentFailure(err)
 		}
 
-		if len(res.ToolCalls) > 0 && choice != "none" {
+		toolsUnsupported.Delete(toolsUnsupportedKey(cfg))
+
+		if len(res.ToolCalls) > 0 {
+			if choice == "none" {
+				tr.fail(st, "Model meminta tool setelah batas eksekusi tercapai.")
+				return a.toolAgentFailure(fmt.Errorf("model mengabaikan tool_choice none"))
+			}
 			if streamed {
-				tr.resetAnswer() // teks sebelum tool call adalah pemikiran model, bukan jawaban
+				tr.resetAnswer() // pengantar model sebelum tool bukan jawaban akhir
 			}
 			names := make([]string, len(res.ToolCalls))
 			for i, c := range res.ToolCalls {
@@ -333,24 +361,20 @@ func runToolAgent(ctx context.Context, a *agentRun, history []ChatTurn, replyNot
 				assistant.Content = &c
 			}
 			msgs = append(msgs, agentChatMsg{msg: assistant})
-			fresh := 0
 			for _, call := range res.ToolCalls {
+				if ctx.Err() != nil {
+					tr.resetAnswer()
+					return nil, ctx.Err()
+				}
 				var out, compact string
-				if calls >= budget.calls {
-					out = `{"error":"Batas tool call untuk jawaban ini tercapai. Jawab dengan bukti yang sudah ada."}`
+				if calls >= budget.calls || researchCtx.Err() != nil {
+					out = `{"error":"Batas eksekusi tool tercapai. Jawab dengan bukti yang sudah ada."}`
 					compact = out
 				} else {
 					calls++
-					var n int
-					out, compact, n = a.runToolCall(ctx, call, round)
-					fresh += n
+					out, compact, _ = a.runToolCall(researchCtx, call, round)
 				}
 				msgs = append(msgs, agentChatMsg{msg: chatMessage{Role: "tool", ToolCallID: call.ID, Content: &out}, compact: compact})
-			}
-			if fresh == 0 {
-				stalled++
-			} else {
-				stalled = 0
 			}
 			continue
 		}
@@ -361,9 +385,6 @@ func runToolAgent(ctx context.Context, a *agentRun, history []ChatTurn, replyNot
 			return a.toolAgentFailure(fmt.Errorf("jawaban kosong"))
 		}
 		st.Kind, st.Title = "answer", "Menyusun jawaban"
-		if len(res.ToolCalls) > 0 {
-			st.Detail = "Model tetap meminta tool walau anggaran habis; jawaban disusun dari bukti yang ada."
-		}
 		if res.FinishReason == "length" {
 			answer += "\n\n_(Jawaban terpotong karena batas panjang keluaran model.)_"
 		}
@@ -392,14 +413,53 @@ func (a *agentRun) runToolCall(ctx context.Context, call toolCall, round int) (o
 	switch {
 	case tool == nil:
 		res = errorResult(fmt.Sprintf("tool %q tidak ada; pilihan: %s", call.Function.Name, strings.Join(toolNames(), ", ")))
-	case raw != "" && json.Unmarshal([]byte(raw), &args) != nil:
+	case raw != "" && (json.Unmarshal([]byte(raw), &args) != nil || args == nil):
 		info.RawArgs = clip(raw, 500)
 		res = errorResult("argumen bukan JSON valid; kirim ulang panggilan dengan objek JSON yang benar")
+	case ctx.Err() != nil:
+		res = errorResult("Eksekusi tool dibatalkan atau melewati batas waktu.")
 	default:
 		info.Arguments = args
+		if msg := validateToolArgs(tool, args); msg != "" {
+			res = errorResult(msg)
+			break
+		}
+		if call.Function.Name == "read_document" {
+			for _, ref := range splitRefs(argString(args, "ref")) {
+				if !a.shownRefs[ref] {
+					res = errorResult("ref tidak dikenal; gunakan ref yang sudah diberikan oleh tool pada jawaban ini")
+					break
+				}
+			}
+			if res.Err != "" {
+				break
+			}
+		}
 		info.Phase = "Menjalankan…"
 		a.tr.update(st)
+		db := a.db
+		if db != nil {
+			a.db = db.WithContext(ctx)
+		}
 		res = tool.Run(ctx, a, args, st)
+		a.db = db
+		if ctx.Err() != nil {
+			res = errorResult("Eksekusi tool dibatalkan atau melewati batas waktu.")
+		}
+		if res.Err == "" {
+			var payload any
+			if json.Unmarshal([]byte(res.Output), &payload) != nil {
+				res = errorResult("Tool mengembalikan hasil yang tidak valid.")
+			} else if m, ok := payload.(map[string]any); ok && m["error"] != nil {
+				res = errorResult("Hasil tool tidak dapat dimuat dalam batas keluaran.")
+			} else {
+				a.successfulTools++
+				if a.cfg.ShareDocContent && (call.Function.Name == "search_documents" || call.Function.Name == "read_document") {
+					a.docContentUsed = true
+				}
+				a.recordShownRefs(payload)
+			}
+		}
 	}
 
 	info.Phase = ""
@@ -419,28 +479,79 @@ func (a *agentRun) runToolCall(ctx context.Context, call toolCall, round int) (o
 	return res.Output, compactToolResult(call.Function.Name, res), res.Fresh
 }
 
+// toolPayloadRefs memeriksa payload final, bukan seluruh kandidat retrieval.
+func toolPayloadRefs(payload any) map[string]bool {
+	refs := map[string]bool{}
+	var collect func(any)
+	collect = func(value any) {
+		switch x := value.(type) {
+		case map[string]any:
+			for key, item := range x {
+				if key == "ref" || key == "doc_ref" {
+					if ref, ok := item.(string); ok {
+						refs[ref] = true
+					}
+				}
+				collect(item)
+			}
+		case []any:
+			for _, item := range x {
+				collect(item)
+			}
+		}
+	}
+	collect(payload)
+	return refs
+}
+
+func (a *agentRun) recordShownRefs(payload any) {
+	if a.shownRefs == nil {
+		a.shownRefs = map[string]bool{}
+	}
+	for ref := range toolPayloadRefs(payload) {
+		if a.docForRef(ref) != nil {
+			a.shownRefs[ref] = true
+		}
+	}
+}
+
 // compactToolResult: ringkasan hasil tool lama (ref & judul) agar putaran panjang tidak memboroskan token.
 func compactToolResult(name string, res toolResult) string {
 	if res.Err != "" {
 		b, _ := json.Marshal(map[string]string{"tool": name, "error": res.Err})
 		return string(b)
 	}
-	refs := make([]string, 0, len(res.Results))
-	for _, r := range res.Results {
-		refs = append(refs, fmt.Sprintf("%s %s (%s)", r.Ref, r.Title, r.Version))
+	if len(res.Results) == 0 {
+		return res.Output
 	}
-	b, _ := json.Marshal(map[string]any{"tool": name, "compact": true, "summary": res.Summary, "refs": refs})
+	refs := make([]string, 0, len(res.Results))
+	var payload any
+	visible := map[string]bool{}
+	if json.Unmarshal([]byte(res.Output), &payload) == nil {
+		visible = toolPayloadRefs(payload)
+	}
+	for _, r := range res.Results {
+		if visible[r.Ref] {
+			refs = append(refs, fmt.Sprintf("%s %s (%s)", r.Ref, r.Title, r.Version))
+		}
+	}
+	b, _ := json.Marshal(map[string]any{"tool": name, "compact": true, "summary": res.Summary, "refs": refs, "note": "Isi hasil lama dipadatkan. Panggil read_document dengan ref yang tersedia bila memerlukan isi dokumen."})
 	return string(b)
 }
 
 // finishToolAnswer menyusun respons akhir: sitasi dari ref yang dikutip, label basis jawaban, dan engine mode.
 func (a *agentRun) finishToolAnswer(answer string, toolCalls int) *AIChatResponse {
-	cleaned, refs, dropped := resolveCitations(answer, func(ref string) bool { return a.docForRef(ref) != nil })
+	cleaned, refs, dropped := resolveCitations(answer, func(ref string) bool { return a.shownRefs[ref] && a.docForRef(ref) != nil })
 	if len(dropped) > 0 {
 		a.note("Sitasi tidak dikenal dibuang", fmt.Sprintf("Ref %s tidak ada di hasil tool jawaban ini sehingga dihapus dari jawaban.", strings.Join(dropped, ", ")))
+		cleaned += fmt.Sprintf("\n\n_(%d sitasi tidak valid dihapus; klaim terkait belum terverifikasi.)_", len(dropped))
 	}
 	citations := a.citationsFromRefs(refs)
 	basis := answerBasisFor(cleaned, len(citations) > 0)
+	if a.successfulTools > 0 && basis == AnswerBasisGeneral {
+		basis = AnswerBasisDocuments
+	}
+	a.tr.trace.DocContentUsed = &a.docContentUsed
 
 	engine := "PANDA Agent · " + a.cfg.Model
 	if a.req.Thinking {
@@ -459,35 +570,19 @@ func (a *agentRun) finishToolAnswer(answer string, toolCalls int) *AIChatRespons
 		MatchedDocuments: citations, AnswerBasis: basis})
 }
 
-// toolAgentFailure: model gagal di tengah jalan. Bukti yang sudah terkumpul tetap disajikan (ringkasan builtin);
-// tanpa bukti, user diberi tahu alasannya beserta kemampuan PANDA AI.
+// AgentError adalah pesan aman untuk klien, tanpa body respons atau kredensial provider.
+type AgentError struct {
+	Message string
+	Cause   error
+}
+
+func (e *AgentError) Error() string { return e.Message }
+func (e *AgentError) Unwrap() error { return e.Cause }
+
+// toolAgentFailure tidak menyusun jawaban pengganti ketika model terhubung gagal.
 func (a *agentRun) toolAgentFailure(err error) (*AIChatResponse, error) {
-	reason := describeLLMFailure(err)
-	scope := scopeLabelFor(a.user)
-	st := a.tr.begin("answer", "Menyusun jawaban otomatis")
-	resp := &AIChatResponse{ScopeLabel: scope}
-	if len(a.pool) > 0 {
-		pool := append([]*evidence(nil), a.pool...)
-		focus := contentSearchTerms(a.req.Prompt, a.known)
-		if a.latest == nil {
-			a.latest = latestSectionDocs(a.docs)
-		}
-		rerankEvidence(pool, focus, a.latest, a.metaSets)
-		citations, contextChunks := a.buildContext(selectEvidence(pool))
-		resp.MatchedDocuments = citations
-		resp.ReplyMarkdown = llmFailureNotice(a.user, reason) + "\n\n" +
-			buildBuiltinSmartSummary(scope, citations, contextChunks, len(a.docs), false, a.missingTerms(focus))
-		resp.EngineMode = "PANDA Agent (Fallback: LLM eksternal gagal)"
-		resp.AnswerBasis = AnswerBasisDocuments
-	} else {
-		resp.ReplyMarkdown = llmFailureNotice(a.user, reason) + "\n\n" + builtinCapabilityReply(scope, len(a.docs))
-		resp.EngineMode = "PANDA Agent (Fallback: LLM eksternal gagal) · " + generalEngineMarker
-		resp.AnswerBasis = AnswerBasisGeneral
-	}
-	st.Detail = "Penjelasan AI tidak tersedia: " + reason + "."
-	a.tr.delta(resp.ReplyMarkdown)
-	a.tr.end(st)
-	return a.tr.finish(resp), nil
+	a.tr.resetAnswer()
+	return nil, &AgentError{Message: "Agent AI gagal: " + describeLLMFailure(err) + ". Tidak ada jawaban pengganti builtin.", Cause: err}
 }
 
 // ─── Mode builtin: sapaan & pertanyaan kemampuan ─────────────────────────────

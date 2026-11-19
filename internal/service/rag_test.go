@@ -229,7 +229,7 @@ func TestTermMatchesAndEscapeLike(t *testing.T) {
 	if !termMatches("aplikasinya", "aplikasi") || termMatches("aplikasinya", "apl") {
 		t.Errorf("awalan hanya untuk kata ≥4 huruf")
 	}
-	if got := escapeLike("50%_[x]"); got != "50[%][_][[]x]" {
+	if got := escapeLike("50%_[x]"); got != `50\%\_[x]` {
 		t.Errorf("escapeLike salah: %q", got)
 	}
 }
